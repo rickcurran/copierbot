@@ -24,7 +24,8 @@ Running `python main.py` now chooses a post type:
 
 1. Generate randomized copier diagnostics
 2. Generate a dry, philosophical system log text
-3. Save output
+3. Render a branded square system-log card image from `assets/templates/system_log_card.png`
+4. Save outputs
 
 ## Persona evolution
 
@@ -94,6 +95,8 @@ The fallback mood is influenced by the API error category (for example: safety r
 ### System log post
 
 - `output/<timestamp>/system_log  <timestamp>.txt`
+- `output/<timestamp>/system_log_card  <timestamp>.png`
+- On persona phase transitions (every 20 posts), Copierbot creates an additional normal timestamped system-log run folder (local-only, <=250 chars).
 
 ## Headline filtering behavior
 
@@ -176,12 +179,19 @@ Available actions:
 - Run `orchestrator.py` (publish latest run)
 - Run `engage.py` (check mentions/reply)
 - Publish a selected timestamped run folder
+- Start/stop recurring `Generate + Publish` scheduler with hourly interval (`1-24`)
+- Start/stop recurring `Mentions` scheduler with minute interval (`1, 5, 10, 15, 20, 30, 60`)
 
 Notes:
 
 - Dashboard binds only to `127.0.0.1` (local machine only).
 - Commands run in background and show live status/output in the page.
 - Mention replies remain text-only (`engage.py` never calls image generation).
+- Header stats show current persona phase, total posts generated, and posts remaining to next phase.
+- Scheduled generate flow runs `main.py`, then publishes all newly created run folders from that cycle in creation order (normal post first, phase-change post second when present).
+- Selected scheduler intervals persist across dashboard stop/restart for both Generate+Publish and Mentions schedulers.
+- When starting Generate+Publish, if a Mastodon post was already published within the selected interval window, the first run is delayed instead of firing immediately.
+- Recent Jobs output auto-links Mastodon URLs so mention-reply links are clickable.
 
 ## Publish To Mastodon
 
@@ -226,11 +236,14 @@ python engage.py --fetch-limit 30 --process-limit 30
 Behavior:
 
 - Fetches `mention` notifications from Mastodon.
+- Uses a persisted Mastodon notifications cursor (`data/mention_cursor.json`) and paginates with `since_id`/`max_id` to avoid missing bursts between checks.
 - Stores mentions in SQLite and processes unhandled rows.
 - If mention text matches patterns like "How are you?", Copierbot generates a local `system_log` style reply and posts it as a reply.
 - Other mentions are marked handled with `no_reply` so they are not repeatedly reprocessed.
-- Replies are tracked in `replies` table and successful replies increment persona post count.
+- Replies are tracked in `replies` table and do not increment persona post count.
 - `engage.py` does not call OpenAI APIs (text or image).
+- Each sent mention reply is archived as a timestamped file under `output/mention_responses/`.
+- Mention response archive files include the Mastodon response URL when available.
 
 ## Persistence Layer
 
@@ -248,6 +261,8 @@ copierbot/
     dashboard.py
     engage.py
     orchestrator.py
+    phase_event.py
+    mention_archive.py
     article_context.py
     ascii_fallback.py
     persona.py

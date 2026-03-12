@@ -92,6 +92,11 @@ def get_persona_context() -> str:
     return PHASE_CONTEXT.get(phase, PHASE_CONTEXT["observer"])
 
 
+def get_persona_state() -> PersonaState:
+    """Return current persona state with phase and posts generated."""
+    return _load_state()
+
+
 def increment_post_counter() -> PersonaState:
     """Increment post counter and advance phase every 20 posts."""
     state = _load_state()

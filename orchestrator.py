@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+import re
 
 from social.mastodon_adapter import MastodonAdapter, MastodonAPIError, load_mastodon_config
 from storage import (
@@ -18,6 +19,7 @@ from storage import (
 
 
 OUTPUT_DIR = Path("output")
+RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?$")
 
 
 def _setup_logging() -> None:
@@ -34,7 +36,7 @@ def _latest_run_dir(output_dir: Path = OUTPUT_DIR) -> Path:
     candidates = [
         path
         for path in output_dir.iterdir()
-        if path.is_dir() and not path.name.startswith("_")
+        if path.is_dir() and bool(RUN_DIR_RE.match(path.name))
     ]
     if not candidates:
         raise RuntimeError(f"No output run folders found in {output_dir}.")

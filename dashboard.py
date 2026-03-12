@@ -1,27 +1,40 @@
-"""Local-only web dashboard for triggering Copierbot CLI commands."""
+"""Local-only web dashboard for triggering Copierbot CLI commands and schedulers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
+from persona import get_persona_state
+from storage import init_storage, list_published_posts
+
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
-MAX_JOBS = 60
+SCHED_PREFS_PATH = BASE_DIR / "data" / "dashboard_scheduler_state.json"
+MAX_JOBS = 80
 MAX_OUTPUT_CHARS = 12000
 HOST = "127.0.0.1"
 PORT = 8787
+RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?$")
+URL_RE = re.compile(r"https?://[^\s<>'\"]+")
+
+GENERATE_INTERVAL_HOURS = list(range(1, 25))
+MENTION_INTERVAL_MINUTES = [1, 5, 10, 15, 20, 30, 60]
 
 
 @dataclass
@@ -38,26 +51,219 @@ class Job:
     output: str = ""
 
 
+@dataclass
+class SchedulerState:
+    """State for one recurring scheduler."""
+
+    key: str
+    label: str
+    interval_seconds: int
+    running: bool = False
+    last_run_at: str = ""
+    next_run_at: str = ""
+    last_result: str = ""
+    thread: threading.Thread | None = None
+    stop_event: threading.Event | None = None
+
+
 JOBS: list[Job] = []
 JOB_LOCK = threading.Lock()
 NEXT_JOB_ID = 1
 
+SCHED_LOCK = threading.Lock()
+SCHEDULERS: dict[str, SchedulerState] = {
+    "generate_publish": SchedulerState(
+        key="generate_publish",
+        label="Generate + Publish",
+        interval_seconds=60 * 60,
+    ),
+    "mentions": SchedulerState(
+        key="mentions",
+        label="Mention Monitor",
+        interval_seconds=5 * 60,
+    ),
+}
+
+
+def _validate_generate_interval_seconds(value: int) -> int:
+    """Clamp generate scheduler interval to allowed hourly options."""
+    hours = max(1, min(24, int(value) // 3600 if int(value) >= 3600 else int(value)))
+    if hours not in GENERATE_INTERVAL_HOURS:
+        hours = 1
+    return hours * 3600
+
+
+def _validate_mentions_interval_seconds(value: int) -> int:
+    """Clamp mention scheduler interval to allowed minute options."""
+    minutes = max(1, int(value) // 60 if int(value) >= 60 else int(value))
+    if minutes not in MENTION_INTERVAL_MINUTES:
+        minutes = 5
+    return minutes * 60
+
+
+def _load_scheduler_preferences() -> dict[str, int]:
+    """Load persisted scheduler interval preferences."""
+    defaults = {
+        "generate_publish_interval_seconds": 3600,
+        "mentions_interval_seconds": 300,
+    }
+    try:
+        raw = json.loads(SCHED_PREFS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return defaults
+    except (OSError, json.JSONDecodeError):
+        return defaults
+
+    def _safe_int(value: object, fallback: int) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "generate_publish_interval_seconds": _validate_generate_interval_seconds(
+            _safe_int(
+                raw.get(
+                    "generate_publish_interval_seconds",
+                    defaults["generate_publish_interval_seconds"],
+                ),
+                defaults["generate_publish_interval_seconds"],
+            )
+        ),
+        "mentions_interval_seconds": _validate_mentions_interval_seconds(
+            _safe_int(
+                raw.get("mentions_interval_seconds", defaults["mentions_interval_seconds"]),
+                defaults["mentions_interval_seconds"],
+            )
+        ),
+    }
+
+
+def _save_scheduler_preferences() -> None:
+    """Persist scheduler interval preferences to disk."""
+    payload = {
+        "generate_publish_interval_seconds": int(SCHEDULERS["generate_publish"].interval_seconds),
+        "mentions_interval_seconds": int(SCHEDULERS["mentions"].interval_seconds),
+    }
+    SCHED_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SCHED_PREFS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _apply_scheduler_preferences() -> None:
+    """Apply persisted preferences to in-memory scheduler defaults."""
+    prefs = _load_scheduler_preferences()
+    SCHEDULERS["generate_publish"].interval_seconds = prefs["generate_publish_interval_seconds"]
+    SCHEDULERS["mentions"].interval_seconds = prefs["mentions_interval_seconds"]
+
+
+_apply_scheduler_preferences()
+
+
+def _now_dt() -> datetime:
+    """Return current local datetime."""
+    return datetime.now().astimezone()
+
 
 def _now_stamp() -> str:
     """Return local timestamp for UI display."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return _now_dt().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _future_stamp(seconds: int) -> str:
+    """Return local timestamp offset by given seconds."""
+    return (_now_dt() + timedelta(seconds=max(0, int(seconds)))).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _is_publishable_run_dir(path: Path) -> bool:
+    """Return True for timestamped output run directories only."""
+    return path.is_dir() and bool(RUN_DIR_RE.match(path.name))
+
+
+def _list_publishable_run_paths() -> list[Path]:
+    """List timestamped output run folders."""
+    if not OUTPUT_DIR.exists():
+        return []
+    return [p for p in OUTPUT_DIR.iterdir() if _is_publishable_run_dir(p)]
 
 
 def _list_run_dirs() -> list[str]:
-    """Return timestamped output run directories, newest first."""
-    if not OUTPUT_DIR.exists():
-        return []
-    runs = [
-        p.name
-        for p in OUTPUT_DIR.iterdir()
-        if p.is_dir() and not p.name.startswith("_")
-    ]
+    """Return publishable run directory names, newest first."""
+    runs = [p.name for p in _list_publishable_run_paths()]
     return sorted(runs, reverse=True)
+
+
+def _parse_run_manifest(manifest_path: Path) -> list[Path]:
+    """Read run manifest entries and return publishable run paths in order."""
+    if not manifest_path.exists():
+        return []
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    raw = manifest_path.read_text(encoding="utf-8")
+    for line in raw.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            path = (BASE_DIR / path).resolve()
+        else:
+            path = path.resolve()
+        if not _is_publishable_run_dir(path):
+            continue
+        if path.parent.resolve() != OUTPUT_DIR.resolve():
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _latest_published_post_time() -> datetime | None:
+    """Return latest Mastodon publish time from storage, localized."""
+    try:
+        init_storage()
+        rows = list_published_posts(platform="mastodon", limit=1)
+    except Exception:
+        return None
+    if not rows:
+        return None
+
+    raw = str(rows[0].get("published_at", "")).strip()
+    if not raw:
+        return None
+    try:
+        parsed_utc = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return parsed_utc.astimezone()
+
+
+def _compute_generate_initial_delay(interval_seconds: int) -> int:
+    """Delay first generate cycle if a publish already happened within interval."""
+    latest = _latest_published_post_time()
+    if latest is None:
+        return 0
+    elapsed = (_now_dt() - latest).total_seconds()
+    if elapsed < 0:
+        elapsed = 0
+    if elapsed >= interval_seconds:
+        return 0
+    return int(math.ceil(interval_seconds - elapsed))
+
+
+def _format_wait_duration(seconds: int) -> str:
+    """Format wait duration for UI status text."""
+    total_minutes = max(1, int(math.ceil(seconds / 60)))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
 
 
 def _trim_output(text: str) -> str:
@@ -65,6 +271,24 @@ def _trim_output(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
     return "[...output trimmed...]\n" + text[-MAX_OUTPUT_CHARS:]
+
+
+def _create_job(label: str, command: list[str]) -> Job:
+    """Create and register job row in memory."""
+    global NEXT_JOB_ID
+    with JOB_LOCK:
+        job = Job(
+            job_id=NEXT_JOB_ID,
+            label=label,
+            command=command,
+            status="queued",
+            started_at=_now_stamp(),
+        )
+        NEXT_JOB_ID += 1
+        JOBS.append(job)
+        if len(JOBS) > MAX_JOBS:
+            del JOBS[:-MAX_JOBS]
+    return job
 
 
 def _run_job(job: Job) -> None:
@@ -98,29 +322,19 @@ def _run_job(job: Job) -> None:
         job.finished_at = _now_stamp()
 
 
-def _enqueue_job(label: str, command: list[str]) -> Job:
-    """Create and enqueue a command job for background execution."""
-    global NEXT_JOB_ID
-    with JOB_LOCK:
-        job = Job(
-            job_id=NEXT_JOB_ID,
-            label=label,
-            command=command,
-            status="queued",
-            started_at=_now_stamp(),
-        )
-        NEXT_JOB_ID += 1
-        JOBS.append(job)
-        if len(JOBS) > MAX_JOBS:
-            del JOBS[:-MAX_JOBS]
-
-    thread = threading.Thread(target=_run_job, args=(job,), daemon=True)
-    thread.start()
+def _enqueue_job(label: str, command: list[str], background: bool = True) -> Job:
+    """Queue command as tracked job; optionally run synchronously."""
+    job = _create_job(label=label, command=command)
+    if background:
+        thread = threading.Thread(target=_run_job, args=(job,), daemon=True)
+        thread.start()
+    else:
+        _run_job(job)
     return job
 
 
 def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str] | None]]]:
-    """Map form action keys to command builders."""
+    """Map form action keys to manual command builders."""
 
     def _cmd_generate(_: dict[str, str]) -> list[str]:
         return [sys.executable, "main.py"]
@@ -131,6 +345,8 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
     def _cmd_publish_selected(payload: dict[str, str]) -> list[str] | None:
         run_dir = (payload.get("run_dir") or "").strip()
         if not run_dir:
+            return None
+        if not RUN_DIR_RE.match(run_dir):
             return None
         return [sys.executable, "orchestrator.py", "--run-dir", f"output/{run_dir}"]
 
@@ -145,10 +361,237 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
     }
 
 
+def _run_generate_publish_cycle() -> str:
+    """Run one scheduled cycle: generate post(s) then publish new runs in order."""
+    manifest_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        prefix="copierbot-run-manifest-",
+        dir=str(BASE_DIR),
+        delete=False,
+    )
+    manifest_path = Path(manifest_file.name)
+    manifest_file.close()
+
+    gen_job = _enqueue_job(
+        label="Scheduled Generate Post",
+        command=[sys.executable, "main.py", "--run-manifest", str(manifest_path)],
+        background=False,
+    )
+    try:
+        if gen_job.status != "succeeded":
+            return f"main.py failed (rc={gen_job.return_code})."
+
+        created = _parse_run_manifest(manifest_path)
+        if not created:
+            return "main.py succeeded; no run-manifest entries found."
+
+        published = 0
+        publish_failed = 0
+        for run_path in created:
+            pub_job = _enqueue_job(
+                label=f"Scheduled Publish {run_path.name}",
+                command=[
+                    sys.executable,
+                    "orchestrator.py",
+                    "--run-dir",
+                    f"output/{run_path.name}",
+                ],
+                background=False,
+            )
+            if pub_job.status == "succeeded":
+                published += 1
+            else:
+                publish_failed += 1
+
+        return (
+            f"generated_runs={len(created)} published={published} "
+            f"publish_failed={publish_failed}."
+        )
+    finally:
+        try:
+            manifest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _run_mention_cycle() -> str:
+    """Run one scheduled mention-monitor cycle."""
+    job = _enqueue_job(
+        label="Scheduled Mention Check",
+        command=[sys.executable, "engage.py"],
+        background=False,
+    )
+    if job.status == "succeeded":
+        return "engage.py completed successfully."
+    return f"engage.py failed (rc={job.return_code})."
+
+
+def _scheduler_loop(
+    state: SchedulerState,
+    runner: Callable[[], str],
+    stop_event: threading.Event,
+    initial_delay_seconds: int = 0,
+) -> None:
+    """Background loop for recurring scheduler."""
+    initial_delay = max(0, int(initial_delay_seconds))
+    if initial_delay > 0 and stop_event.wait(initial_delay):
+        with SCHED_LOCK:
+            state.running = False
+            state.next_run_at = ""
+            state.thread = None
+            state.stop_event = None
+        return
+
+    while not stop_event.is_set():
+        with SCHED_LOCK:
+            state.last_run_at = _now_stamp()
+            state.last_result = "running..."
+            state.next_run_at = ""
+
+        try:
+            result = runner()
+        except Exception as exc:  # defensive, runner already handles subprocess statuses
+            result = f"runner error: {exc}"
+
+        with SCHED_LOCK:
+            if not state.running:
+                break
+            state.last_result = result
+            state.next_run_at = _future_stamp(state.interval_seconds)
+
+        if stop_event.wait(state.interval_seconds):
+            break
+
+    with SCHED_LOCK:
+        state.running = False
+        state.next_run_at = ""
+        state.thread = None
+        state.stop_event = None
+
+
+def _stop_scheduler(key: str) -> None:
+    """Stop a running scheduler by key."""
+    with SCHED_LOCK:
+        state = SCHEDULERS[key]
+        event = state.stop_event
+        thread = state.thread
+        state.running = False
+        state.next_run_at = ""
+
+    if event is not None:
+        event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+
+    with SCHED_LOCK:
+        state = SCHEDULERS[key]
+        state.thread = None
+        state.stop_event = None
+
+
+def _start_scheduler(
+    key: str,
+    interval_seconds: int,
+    runner: Callable[[], str],
+    initial_delay_seconds: int = 0,
+    queued_message: str = "queued",
+) -> None:
+    """Start scheduler with given interval, restarting if already running."""
+    _stop_scheduler(key)
+
+    state = SCHEDULERS[key]
+    stop_event = threading.Event()
+    delay = max(0, int(initial_delay_seconds))
+    thread = threading.Thread(
+        target=_scheduler_loop,
+        args=(state, runner, stop_event, delay),
+        daemon=True,
+        name=f"copierbot-scheduler-{key}",
+    )
+
+    with SCHED_LOCK:
+        state.interval_seconds = max(1, int(interval_seconds))
+        _save_scheduler_preferences()
+        state.running = True
+        state.last_result = queued_message
+        state.next_run_at = _future_stamp(delay) if delay > 0 else _now_stamp()
+        state.stop_event = stop_event
+        state.thread = thread
+
+    thread.start()
+
+
+def _scheduler_snapshot() -> dict[str, dict[str, str | int | bool]]:
+    """Return immutable scheduler state for UI rendering."""
+    with SCHED_LOCK:
+        snap: dict[str, dict[str, str | int | bool]] = {}
+        for key, state in SCHEDULERS.items():
+            snap[key] = {
+                "label": state.label,
+                "interval_seconds": state.interval_seconds,
+                "running": state.running,
+                "last_run_at": state.last_run_at,
+                "next_run_at": state.next_run_at,
+                "last_result": state.last_result,
+            }
+        return snap
+
+
+def _render_job_card(job: Job) -> str:
+    """Render one job card with metadata and captured output."""
+    command_text = " ".join(html.escape(part) for part in job.command)
+    output = _render_output_with_links(job.output or "(no output)")
+    return_code = "" if job.return_code is None else f" | rc={job.return_code}"
+    finished = f" | finished={html.escape(job.finished_at)}" if job.finished_at else ""
+
+    return (
+        "<article class='job'>"
+        f"<div><strong>#{job.job_id}</strong> {html.escape(job.label)}</div>"
+        f"<div class='meta'>started={html.escape(job.started_at)}{finished}{return_code}</div>"
+        f"<div class='status {html.escape(job.status)}'>{html.escape(job.status)}</div>"
+        f"<div class='meta'>cmd: <code>{command_text}</code></div>"
+        "<details><summary>Output</summary>"
+        f"<pre>{output}</pre>"
+        "</details>"
+        "</article>"
+    )
+
+
+def _split_url_punctuation(token: str) -> tuple[str, str]:
+    """Split trailing punctuation from URL-like token."""
+    trailing = ""
+    while token and token[-1] in ".,);]":
+        trailing = token[-1] + trailing
+        token = token[:-1]
+    return token, trailing
+
+
+def _render_output_with_links(text: str) -> str:
+    """Escape output text and convert URLs into clickable links."""
+    parts: list[str] = []
+    last = 0
+    for match in URL_RE.finditer(text):
+        start, end = match.span()
+        parts.append(html.escape(text[last:start]))
+        raw_token = text[start:end]
+        core, trailing = _split_url_punctuation(raw_token)
+        href = html.escape(core, quote=True)
+        label = html.escape(core)
+        parts.append(
+            f"<a href=\"{href}\" target=\"_blank\" rel=\"noopener noreferrer\">{label}</a>"
+        )
+        if trailing:
+            parts.append(html.escape(trailing))
+        last = end
+    parts.append(html.escape(text[last:]))
+    return "".join(parts)
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP request handler for Copierbot dashboard."""
 
-    server_version = "CopierbotDashboard/1.0"
+    server_version = "CopierbotDashboard/2.0"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -175,7 +618,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
             label, cmd_builder = action_info
             command = cmd_builder(payload)
             if command:
-                _enqueue_job(label=label, command=command)
+                _enqueue_job(label=label, command=command, background=True)
+        elif action == "start_generate_scheduler":
+            hours_raw = (payload.get("generate_interval_hours") or "1").strip()
+            try:
+                hours = int(hours_raw)
+            except ValueError:
+                hours = 1
+            if hours not in GENERATE_INTERVAL_HOURS:
+                hours = 1
+            interval_seconds = hours * 60 * 60
+            initial_delay_seconds = _compute_generate_initial_delay(interval_seconds)
+            queued_message = "queued"
+            if initial_delay_seconds > 0:
+                queued_message = (
+                    "waiting "
+                    f"{_format_wait_duration(initial_delay_seconds)}; "
+                    "recent publish detected."
+                )
+            _start_scheduler(
+                key="generate_publish",
+                interval_seconds=interval_seconds,
+                runner=_run_generate_publish_cycle,
+                initial_delay_seconds=initial_delay_seconds,
+                queued_message=queued_message,
+            )
+        elif action == "stop_generate_scheduler":
+            _stop_scheduler("generate_publish")
+        elif action == "start_mentions_scheduler":
+            mins_raw = (payload.get("mentions_interval_minutes") or "5").strip()
+            try:
+                minutes = int(mins_raw)
+            except ValueError:
+                minutes = 5
+            if minutes not in MENTION_INTERVAL_MINUTES:
+                minutes = 5
+            _start_scheduler(
+                key="mentions",
+                interval_seconds=minutes * 60,
+                runner=_run_mention_cycle,
+            )
+        elif action == "stop_mentions_scheduler":
+            _stop_scheduler("mentions")
 
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/")
@@ -187,6 +671,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _render_index(self) -> None:
         runs = _list_run_dirs()
+        persona_state = get_persona_state()
+        sched = _scheduler_snapshot()
         with JOB_LOCK:
             jobs = list(reversed(JOBS))
 
@@ -206,13 +692,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         job_cards = "\n".join(_render_job_card(job) for job in jobs) or "<p>No jobs yet.</p>"
 
+        gp = sched["generate_publish"]
+        mn = sched["mentions"]
+        gp_hours_selected = max(1, int(gp["interval_seconds"]) // 3600)
+        mn_mins_selected = max(1, int(mn["interval_seconds"]) // 60)
+
+        gp_options = "".join(
+            (
+                f"<option value='{h}'{' selected' if h == gp_hours_selected else ''}>"
+                f"Every {h} hour{'s' if h != 1 else ''}</option>"
+            )
+            for h in GENERATE_INTERVAL_HOURS
+        )
+        mn_options = "".join(
+            (
+                f"<option value='{m}'{' selected' if m == mn_mins_selected else ''}>"
+                f"Every {m} minute{'s' if m != 1 else ''}</option>"
+            )
+            for m in MENTION_INTERVAL_MINUTES
+        )
+
         body = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Copierbot Dashboard</title>
-  <meta http-equiv="refresh" content="4" />
   <style>
     :root {{
       --bg: #f4f0e9;
@@ -234,9 +739,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         var(--bg);
       min-height: 100vh;
     }}
-    .wrap {{ max-width: 1024px; margin: 0 auto; padding: 1.1rem; }}
+    .wrap {{ max-width: 1080px; margin: 0 auto; padding: 1.1rem; }}
     h1 {{ margin: 0 0 0.7rem; font-size: 1.6rem; letter-spacing: 0.01em; }}
+    h2 {{ margin: 0 0 0.55rem; font-size: 1rem; }}
     .sub {{ margin: 0 0 1rem; color: var(--muted); font-size: 0.95rem; }}
+    .toolbar {{
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      margin: 0 0 0.9rem;
+      flex-wrap: wrap;
+    }}
+    .toolbar button {{
+      width: auto;
+      min-width: 110px;
+    }}
+    .toolbar label {{
+      font-size: 0.9rem;
+      color: var(--muted);
+    }}
     .alert {{
       border: 1px solid var(--border);
       background: #fffbe8;
@@ -246,7 +767,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
       border-radius: 8px;
       font-size: 0.95rem;
     }}
-    .grid {{ display: grid; gap: 0.9rem; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }}
+    .stats {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 0.55rem;
+      margin-bottom: 1rem;
+    }}
+    .stat {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.6rem 0.75rem;
+    }}
+    .stat .k {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }}
+    .stat .v {{ font-size: 1rem; font-weight: 700; margin-top: 0.1rem; }}
+    .grid {{ display: grid; gap: 0.9rem; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }}
     .card {{
       background: var(--card);
       border: 1px solid var(--border);
@@ -254,9 +789,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
       padding: 0.9rem;
       box-shadow: 0 3px 10px rgba(0,0,0,0.04);
     }}
-    .card h2 {{ margin: 0 0 0.55rem; font-size: 1rem; }}
     .hint {{ margin: 0 0 0.6rem; color: var(--muted); font-size: 0.86rem; line-height: 1.3; }}
+    .sched-meta {{ margin: 0.25rem 0; color: var(--muted); font-size: 0.84rem; line-height: 1.35; }}
+    .sched-status {{ font-weight: 700; font-size: 0.8rem; text-transform: uppercase; }}
+    .sched-status.running {{ color: #166534; }}
+    .sched-status.stopped {{ color: #7c2d12; }}
     form {{ margin: 0; }}
+    .inline {{ display: flex; gap: 0.45rem; align-items: center; margin-bottom: 0.5rem; }}
     button {{
       width: 100%;
       border: none;
@@ -267,6 +806,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
       font-weight: 600;
       cursor: pointer;
     }}
+    button.stop {{ background: linear-gradient(145deg, #9a3412, #7c2d12); }}
     button:hover {{ filter: brightness(1.05); }}
     select {{
       width: 100%;
@@ -307,10 +847,72 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <body>
   <div class="wrap">
     <h1>Copierbot Local Dashboard</h1>
-    <p class="sub">Local-only controls bound to 127.0.0.1. Auto-refreshes every 4 seconds.</p>
+    <p class="sub">Local-only controls bound to 127.0.0.1.</p>
+    <div class="toolbar">
+      <button id="refresh-now" type="button">Refresh Now</button>
+      <label>
+        <input id="auto-refresh" type="checkbox" />
+        Auto refresh (15s)
+      </label>
+      <span class="meta">Status: <strong id="auto-status">Off</strong></span>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="k">Posts Generated</div>
+        <div class="v">{int(persona_state["posts_generated"])}</div>
+      </div>
+      <div class="stat">
+        <div class="k">Persona Phase</div>
+        <div class="v">{html.escape(str(persona_state["phase"]).upper())}</div>
+      </div>
+      <div class="stat">
+        <div class="k">Next Phase In</div>
+        <div class="v">{20 - (int(persona_state["posts_generated"]) % 20) if str(persona_state["phase"]) != "self_aware" else 0}</div>
+      </div>
+    </div>
+
     {alert_html}
 
     <div class="grid">
+      <div class="card">
+        <h2>Scheduler: Generate + Publish</h2>
+        <p class="hint">Runs <code>main.py</code>, then publishes all new run folders from that cycle in creation order (normal post first, phase-change post second when present).</p>
+        <div class="sched-status {'running' if bool(gp['running']) else 'stopped'}">{'running' if bool(gp['running']) else 'stopped'}</div>
+        <p class="sched-meta">Last run: {html.escape(str(gp['last_run_at']) or 'N/A')}</p>
+        <p class="sched-meta">Next run: {html.escape(str(gp['next_run_at']) or 'N/A')}</p>
+        <p class="sched-meta">Last result: {html.escape(str(gp['last_result']) or 'N/A')}</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="start_generate_scheduler" />
+          <select name="generate_interval_hours">{gp_options}</select>
+          <button type="submit">Start / Update Generate Scheduler</button>
+        </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="stop_generate_scheduler" />
+          <button class="stop" type="submit">Stop Generate Scheduler</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Scheduler: Mentions</h2>
+        <p class="hint">Runs <code>engage.py</code> on the selected minute interval to monitor and reply to qualifying mentions.</p>
+        <div class="sched-status {'running' if bool(mn['running']) else 'stopped'}">{'running' if bool(mn['running']) else 'stopped'}</div>
+        <p class="sched-meta">Last run: {html.escape(str(mn['last_run_at']) or 'N/A')}</p>
+        <p class="sched-meta">Next run: {html.escape(str(mn['next_run_at']) or 'N/A')}</p>
+        <p class="sched-meta">Last result: {html.escape(str(mn['last_result']) or 'N/A')}</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="start_mentions_scheduler" />
+          <select name="mentions_interval_minutes">{mn_options}</select>
+          <button type="submit">Start / Update Mention Scheduler</button>
+        </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="stop_mentions_scheduler" />
+          <button class="stop" type="submit">Stop Mention Scheduler</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:0.9rem;">
       <div class="card">
         <h2>Generate</h2>
         <p class="hint">Runs <code>main.py</code> to create a new Copierbot post in a fresh timestamped output folder.</p>
@@ -354,6 +956,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
       {job_cards}
     </div>
   </div>
+  <script>
+    (() => {{
+      const key = "copierbot_dashboard_auto_refresh";
+      const intervalMs = 15000;
+      const refreshBtn = document.getElementById("refresh-now");
+      const checkbox = document.getElementById("auto-refresh");
+      const status = document.getElementById("auto-status");
+      let timer = null;
+
+      const apply = (enabled) => {{
+        if (timer) {{
+          clearInterval(timer);
+          timer = null;
+        }}
+        if (enabled) {{
+          timer = window.setInterval(() => window.location.reload(), intervalMs);
+          status.textContent = "On (15s)";
+        }} else {{
+          status.textContent = "Off";
+        }}
+        checkbox.checked = !!enabled;
+        window.localStorage.setItem(key, enabled ? "1" : "0");
+      }};
+
+      refreshBtn.addEventListener("click", () => window.location.reload());
+      checkbox.addEventListener("change", () => apply(checkbox.checked));
+      apply(window.localStorage.getItem(key) === "1");
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -365,26 +996,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def _render_job_card(job: Job) -> str:
-    """Render one job card with metadata and captured output."""
-    command_text = " ".join(html.escape(part) for part in job.command)
-    output = html.escape(job.output or "(no output)")
-    return_code = "" if job.return_code is None else f" | rc={job.return_code}"
-    finished = f" | finished={html.escape(job.finished_at)}" if job.finished_at else ""
-
-    return (
-        "<article class='job'>"
-        f"<div><strong>#{job.job_id}</strong> {html.escape(job.label)}</div>"
-        f"<div class='meta'>started={html.escape(job.started_at)}{finished}{return_code}</div>"
-        f"<div class='status {html.escape(job.status)}'>{html.escape(job.status)}</div>"
-        f"<div class='meta'>cmd: <code>{command_text}</code></div>"
-        "<details><summary>Output</summary>"
-        f"<pre>{output}</pre>"
-        "</details>"
-        "</article>"
-    )
-
-
 def run_server() -> None:
     """Run local-only dashboard server."""
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
@@ -394,6 +1005,8 @@ def run_server() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        for key in list(SCHEDULERS.keys()):
+            _stop_scheduler(key)
         server.server_close()
 
 

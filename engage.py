@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import logging
+from pathlib import Path
 import re
 from typing import Any
 
 from config import get_settings
-from persona import get_persona_context, increment_post_counter
+from mention_archive import save_mention_response_log
+from persona import get_persona_context
 from social.mastodon_adapter import MastodonAPIError, MastodonAdapter, load_mastodon_config
 from storage import (
     create_reply_record,
@@ -21,6 +24,8 @@ from storage import (
 )
 from system_log import generate_system_log_local
 
+
+MENTION_CURSOR_PATH = Path("data/mention_cursor.json")
 
 CHECKIN_PATTERNS = [
     re.compile(r"\bhow\s+(are|r)\s+you\b", re.IGNORECASE),
@@ -63,6 +68,54 @@ def _normalize_author_handle(acct: str) -> str:
     """Normalize account handle for reply prefixing."""
     normalized = (acct or "").strip().lstrip("@")
     return f"@{normalized}" if normalized else ""
+
+
+def _safe_int(value: str) -> int | None:
+    """Parse integer-like snowflake id safely."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _snowflake_max(a: str, b: str) -> str:
+    """Return larger snowflake id between two values."""
+    if not a:
+        return b
+    if not b:
+        return a
+    ai = _safe_int(a)
+    bi = _safe_int(b)
+    if ai is not None and bi is not None:
+        return b if bi > ai else a
+    return b if b > a else a
+
+
+def _snowflake_min(values: list[str]) -> str:
+    """Return smallest snowflake id from non-empty list."""
+    candidates = [v for v in values if v]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda x: _safe_int(x) if _safe_int(x) is not None else 0)
+
+
+def _load_mention_cursor() -> str:
+    """Load last processed Mastodon notification id cursor."""
+    try:
+        raw = json.loads(MENTION_CURSOR_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    cursor = str(raw.get("last_notification_id", "")).strip()
+    return cursor
+
+
+def _save_mention_cursor(cursor: str) -> None:
+    """Persist last processed Mastodon notification id cursor."""
+    MENTION_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_notification_id": (cursor or "").strip()}
+    MENTION_CURSOR_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _extract_mention_payload(notification: dict[str, Any], self_account_id: str) -> dict[str, str] | None:
@@ -142,20 +195,56 @@ def _build_reply_text(
 
 def ingest_mentions(adapter: MastodonAdapter, self_account_id: str, fetch_limit: int = 20) -> int:
     """Fetch mention notifications and upsert them into local storage."""
-    notifications = adapter.fetch_notifications(types=["mention"], limit=fetch_limit)
+    since_id = _load_mention_cursor()
+    max_id = ""
+    seen_notification_ids: set[str] = set()
     inserted = 0
-    for notification in notifications:
-        mention = _extract_mention_payload(notification, self_account_id=self_account_id)
-        if mention is None:
-            continue
-        upsert_mention(
-            platform="mastodon",
-            mention_id=mention["mention_id"],
-            author=mention["author"],
-            text=mention["text"],
-            source_created_at=mention["source_created_at"],
+    highest_notification_id = since_id
+
+    while True:
+        notifications = adapter.fetch_notifications(
+            types=["mention"],
+            limit=fetch_limit,
+            since_id=since_id,
+            max_id=max_id,
         )
-        inserted += 1
+        if not notifications:
+            break
+
+        page_ids: list[str] = []
+        for notification in notifications:
+            notification_id = str(notification.get("id", "")).strip()
+            if notification_id:
+                page_ids.append(notification_id)
+                if notification_id in seen_notification_ids:
+                    continue
+                seen_notification_ids.add(notification_id)
+                highest_notification_id = _snowflake_max(highest_notification_id, notification_id)
+
+            mention = _extract_mention_payload(notification, self_account_id=self_account_id)
+            if mention is None:
+                continue
+            upsert_mention(
+                platform="mastodon",
+                mention_id=mention["mention_id"],
+                author=mention["author"],
+                text=mention["text"],
+                source_created_at=mention["source_created_at"],
+            )
+            inserted += 1
+
+        if len(notifications) < fetch_limit:
+            break
+        oldest_notification_id = _snowflake_min(page_ids)
+        if not oldest_notification_id:
+            break
+        if max_id and oldest_notification_id == max_id:
+            break
+        max_id = oldest_notification_id
+
+    if highest_notification_id and highest_notification_id != since_id:
+        _save_mention_cursor(highest_notification_id)
+
     return inserted
 
 
@@ -211,19 +300,32 @@ def process_unhandled_mentions(
                 idempotency_key=f"mention-reply:{mention_id}",
             )
             remote_reply_id = str(payload.get("id", "")).strip()
+            remote_reply_url = str(payload.get("url") or payload.get("uri") or "").strip()
             update_reply_record(
                 reply_row_id=reply_row_id,
                 status="sent",
                 remote_reply_id=remote_reply_id,
             )
+            mention_log_path = save_mention_response_log(
+                mention_id=mention_id,
+                author=mention_author,
+                original_text=mention_text,
+                reply_text=reply_text,
+                response_url=remote_reply_url,
+            )
+            logging.info("Saved mention response log to %s", mention_log_path)
             mark_mention_handled(
                 mention_row_id=mention_row_id,
                 classification=classification,
                 decision="replied_system_log",
             )
-            increment_post_counter()
             stats["replied"] += 1
-            logging.info("Replied to mention %s from %s", mention_id, mention_author or "unknown")
+            logging.info(
+                "Replied to mention %s from %s%s",
+                mention_id,
+                mention_author or "unknown",
+                f" -> {remote_reply_url}" if remote_reply_url else "",
+            )
         except Exception as exc:
             if reply_row_id is None:
                 create_reply_record(
@@ -253,8 +355,8 @@ def run() -> None:
     parser.add_argument(
         "--fetch-limit",
         type=int,
-        default=20,
-        help="How many notifications to fetch from Mastodon (1-40).",
+        default=40,
+        help="Per-page notifications fetch size from Mastodon (1-80).",
     )
     parser.add_argument(
         "--process-limit",
@@ -284,7 +386,7 @@ def run() -> None:
     ingested = ingest_mentions(
         adapter=adapter,
         self_account_id=self_account_id,
-        fetch_limit=max(1, min(args.fetch_limit, 40)),
+        fetch_limit=max(1, min(args.fetch_limit, 80)),
     )
     stats = process_unhandled_mentions(
         adapter=adapter,

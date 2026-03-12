@@ -1,5 +1,6 @@
 """CLI entrypoint for Copierbot."""
 
+import argparse
 import logging
 import random
 import time
@@ -16,8 +17,10 @@ from config import get_settings
 from creative import generate_collage_concept_and_prompt
 from image_gen import generate_image
 from news import choose_headline, get_headlines
-from persona import get_persona_context, increment_post_counter
+from persona import get_persona_context, get_persona_state, increment_post_counter
+from phase_event import save_phase_change_system_log
 from system_log import generate_system_log
+from system_log_card import card_path_for_system_log, render_system_log_card
 from title_gen import generate_title
 
 
@@ -190,9 +193,30 @@ def run_system_log_post(client: OpenAI, settings, persona_context: str, system_l
     )
     save_text(system_log_path, system_log)
     logging.info("Saved system log to %s", system_log_path)
+    card_path = card_path_for_system_log(system_log_path)
+    try:
+        render_system_log_card(system_log_text=system_log, output_path=card_path)
+        logging.info("Saved system log card to %s", card_path)
+    except Exception as exc:
+        logging.warning("Failed to render system log card: %s", exc)
 
 
-def run() -> None:
+def _write_run_manifest(path: Path, run_dirs: list[Path]) -> None:
+    """Write created run directories, one per line, preserving order."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for run_dir in run_dirs:
+        normalized = str(run_dir.resolve())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(run_dir.resolve())
+    payload = "\n".join(str(item) for item in unique).strip()
+    path.write_text((payload + "\n") if payload else "", encoding="utf-8")
+
+
+def run(run_manifest_path: Path | None = None) -> None:
     """Execute the full Copierbot pipeline."""
     setup_logging()
     settings = get_settings()
@@ -200,6 +224,7 @@ def run() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     image_path, prompt_path, caption_path, system_log_path, run_dir = build_output_paths()
     logging.info("Output folder for this run: %s", run_dir)
+    created_run_dirs: list[Path] = [Path(run_dir).resolve()]
     persona_context = get_persona_context()
     logging.info("Persona context loaded.")
     logging.info("Post mode: %s", settings.post_mode)
@@ -223,19 +248,43 @@ def run() -> None:
             caption_path=caption_path,
         )
 
+    previous_state = get_persona_state()
     new_state = increment_post_counter()
     logging.info(
         "Persona updated -> phase: %s, posts_generated: %d",
         new_state["phase"],
         new_state["posts_generated"],
     )
+    if previous_state["phase"] != new_state["phase"]:
+        phase_log_path = save_phase_change_system_log(
+            output_root=OUTPUT_DIR,
+            previous_phase=previous_state["phase"],
+            new_phase=new_state["phase"],
+            posts_generated=new_state["posts_generated"],
+            max_chars=250,
+        )
+        logging.info("Saved phase-change system log to %s", phase_log_path)
+        created_run_dirs.append(phase_log_path.parent.resolve())
+
+    if run_manifest_path is not None:
+        _write_run_manifest(run_manifest_path, created_run_dirs)
+        logging.info("Wrote run manifest to %s", run_manifest_path)
 
     logging.info("Copierbot run complete.")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate Copierbot post(s).")
+    parser.add_argument(
+        "--run-manifest",
+        default="",
+        help="Optional path to write created output run directories (one per line).",
+    )
+    args = parser.parse_args()
+
     try:
-        run()
+        manifest_path = Path(args.run_manifest).resolve() if args.run_manifest else None
+        run(run_manifest_path=manifest_path)
     except Exception as exc:
         logging.basicConfig(level=logging.ERROR, format="%(levelname)s | %(message)s")
         logging.error("Pipeline failed: %s", exc)

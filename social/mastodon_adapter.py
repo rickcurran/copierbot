@@ -201,9 +201,10 @@ class MastodonAdapter:
         limit: int = 20,
         since_id: str = "",
         min_id: str = "",
+        max_id: str = "",
     ) -> list[dict]:
         """Fetch notifications (mentions, follows, etc.)."""
-        limit = max(1, min(limit, 40))
+        limit = max(1, min(limit, 80))
         params: list[tuple[str, Any]] = [("limit", limit)]
         for notification_type in (types or []):
             params.append(("types[]", notification_type))
@@ -211,6 +212,8 @@ class MastodonAdapter:
             params.append(("since_id", since_id))
         if min_id:
             params.append(("min_id", min_id))
+        if max_id:
+            params.append(("max_id", max_id))
 
         payload = self._request("GET", "/api/v1/notifications", params=params)
         if not isinstance(payload, list):
