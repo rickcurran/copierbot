@@ -27,6 +27,11 @@ from title_gen import generate_title
 OUTPUT_DIR = Path("output")
 
 
+def get_generation_char_limit(settings) -> int:
+    """Return cross-platform max chars for generated post text."""
+    return min(settings.mastodon_max_chars, settings.bluesky_max_chars)
+
+
 def setup_logging() -> None:
     """Configure readable console logging."""
     logging.basicConfig(
@@ -59,7 +64,7 @@ def build_output_paths() -> tuple[Path, Path, Path, Path, str]:
         suffix += 1
 
     run_dir.mkdir(parents=True, exist_ok=False)
-    image_path = run_dir / f"image  {timestamp}.png"
+    image_path = run_dir / f"image  {timestamp}.jpg"
     prompt_path = run_dir / f"prompt  {timestamp}.txt"
     caption_path = run_dir / f"caption  {timestamp}.txt"
     system_log_path = run_dir / f"system_log  {timestamp}.txt"
@@ -80,7 +85,7 @@ def run_news_post(
     caption_path: Path,
 ) -> None:
     """Generate a standard news collage post."""
-    max_post_chars = settings.mastodon_max_chars if settings.post_mode == "mastodon" else None
+    max_post_chars = get_generation_char_limit(settings)
     logging.info("Fetching current headlines...")
     headlines = get_headlines(
         news_api_key=settings.news_api_key,
@@ -95,8 +100,13 @@ def run_news_post(
     if article_url:
         logging.info("Selected article URL: %s", article_url)
 
-    safe_headline = anonymize_headline_names(headline)
-    logging.info("Anonymized headline for generation: %s", safe_headline)
+    safe_headline = headline
+    if settings.enable_name_obfuscation:
+        safe_headline = anonymize_headline_names(headline)
+        logging.info("Name obfuscation enabled.")
+        logging.info("Headline used for generation: %s", safe_headline)
+    else:
+        logging.info("Name obfuscation disabled; using original headline.")
 
     article_context = build_article_context(
         headline=safe_headline,
@@ -184,7 +194,7 @@ def run_news_post(
 def run_system_log_post(client: OpenAI, settings, persona_context: str, system_log_path: Path) -> None:
     """Generate a system-log-only post."""
     logging.info("Generating system log post...")
-    max_post_chars = settings.mastodon_max_chars if settings.post_mode == "mastodon" else None
+    max_post_chars = get_generation_char_limit(settings)
     system_log = generate_system_log(
         client=client,
         model=settings.text_model,
@@ -228,6 +238,12 @@ def run(run_manifest_path: Path | None = None) -> None:
     persona_context = get_persona_context()
     logging.info("Persona context loaded.")
     logging.info("Post mode: %s", settings.post_mode)
+    logging.info(
+        "Generation char limit: %d (min of Mastodon=%d, Bluesky=%d)",
+        get_generation_char_limit(settings),
+        settings.mastodon_max_chars,
+        settings.bluesky_max_chars,
+    )
 
     post_type = choose_post_type()
     logging.info("Selected post type: %s", post_type)

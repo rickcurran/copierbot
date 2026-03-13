@@ -77,7 +77,7 @@ Example:
 - generated title
 - original headline
 - source article URL
-- anonymized headline used for generation
+- headline used for generation (obfuscated only if enabled)
 - story context and extracted source visual cues
 - image render mode (`openai_image` or `ascii_fallback`)
 - image error context when fallback is used
@@ -85,11 +85,11 @@ Example:
 
 Saved files:
 
-- `output/<timestamp>/image  <timestamp>.png`
+- `output/<timestamp>/image  <timestamp>.jpg`
 - `output/<timestamp>/caption  <timestamp>.txt`
 - `output/<timestamp>/prompt  <timestamp>.txt`
 
-If OpenAI image generation fails, Copierbot creates a local fallback PNG at the same image path using ASCII-art diagnostics.  
+If OpenAI image generation fails, Copierbot creates a local fallback image at the same image path using ASCII-art diagnostics.  
 The fallback mood is influenced by the API error category (for example: safety rejection, rate limit, auth, network, or inspiration drought).
 
 ### System log post
@@ -144,16 +144,24 @@ NEWS_API_KEY=your_newsapi_key_here
 NEWS_COUNTRY=us
 NEWS_PAGE_SIZE=40
 POST_MODE=default
-MASTODON_MAX_CHARS=500
+MASTODON_MAX_CHARS=300
+ENABLE_NAME_OBFUSCATION=false
 MASTODON_BASE_URL=https://mastodon.social
 MASTODON_ACCESS_TOKEN=your_mastodon_access_token_here
 MASTODON_VISIBILITY=unlisted
+BLUESKY_PDS_URL=https://bsky.social
+BLUESKY_HANDLE=your.handle.bsky.social
+BLUESKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+BLUESKY_MAX_CHARS=300
 ```
 
 Post length modes:
 
-- `POST_MODE=default`: allows longer generated captions/system logs.
-- `POST_MODE=mastodon`: generation uses `MASTODON_MAX_CHARS` as a hard character constraint (no truncation; it rewrites to fit).
+- Generated captions/system logs use a cross-platform hard limit:
+  `min(MASTODON_MAX_CHARS, BLUESKY_MAX_CHARS)`.
+- With the defaults above, generated text is capped at `300` chars.
+- `ENABLE_NAME_OBFUSCATION=false` (default): uses original headlines.
+- `ENABLE_NAME_OBFUSCATION=true`: applies person-name obfuscation before generation.
 
 ## Run
 
@@ -179,6 +187,7 @@ Available actions:
 - Run `orchestrator.py` (publish latest run)
 - Run `engage.py` (check mentions/reply)
 - Publish a selected timestamped run folder
+- Set active publish destinations (`Mastodon`, `Bluesky`, or both)
 - Start/stop recurring `Generate + Publish` scheduler with hourly interval (`1-24`)
 - Start/stop recurring `Mentions` scheduler with minute interval (`1, 5, 10, 15, 20, 30, 60`)
 
@@ -187,13 +196,14 @@ Notes:
 - Dashboard binds only to `127.0.0.1` (local machine only).
 - Commands run in background and show live status/output in the page.
 - Mention replies remain text-only (`engage.py` never calls image generation).
+- Generate + Publish always generates once per cycle, then publishes that same run to active destinations.
 - Header stats show current persona phase, total posts generated, and posts remaining to next phase.
 - Scheduled generate flow runs `main.py`, then publishes all newly created run folders from that cycle in creation order (normal post first, phase-change post second when present).
 - Selected scheduler intervals persist across dashboard stop/restart for both Generate+Publish and Mentions schedulers.
-- When starting Generate+Publish, if a Mastodon post was already published within the selected interval window, the first run is delayed instead of firing immediately.
-- Recent Jobs output auto-links Mastodon URLs so mention-reply links are clickable.
+- When starting Generate+Publish, if an active-platform post was already published within the selected interval window, the first run is delayed instead of firing immediately.
+- Recent Jobs output auto-links URLs (for example Mastodon/Bluesky links) in job logs.
 
-## Publish To Mastodon
+## Publish To Social Platforms
 
 Publish the latest run folder:
 
@@ -213,11 +223,24 @@ Override visibility for one publish:
 python orchestrator.py --visibility public
 ```
 
+Publish to Bluesky instead:
+
+```bash
+python orchestrator.py --platform bluesky
+```
+
+Publish to both Mastodon and Bluesky in one run:
+
+```bash
+python orchestrator.py --platform all
+```
+
 Publish behavior:
 
 - Uses idempotent job tracking in SQLite (`data/copierbot.db`) to avoid duplicate posts.
 - News run: uploads image + posts caption text.
 - System log run: posts system-log text only.
+- `--platform` options: `mastodon` (default), `bluesky`, or `all`.
 
 ## Monitor Mentions And Reply
 
@@ -230,13 +253,16 @@ python engage.py
 Optional flags:
 
 ```bash
-python engage.py --fetch-limit 30 --process-limit 30
+python engage.py --platform all --fetch-limit 30 --process-limit 30
 ```
 
 Behavior:
 
-- Fetches `mention` notifications from Mastodon.
-- Uses a persisted Mastodon notifications cursor (`data/mention_cursor.json`) and paginates with `since_id`/`max_id` to avoid missing bursts between checks.
+- Supports `--platform mastodon|bluesky|all` (default `all`).
+- Fetches mention/reply notifications from selected platform(s).
+- Uses persisted platform cursors:
+  - Mastodon: `data/mention_cursor.json` (`since_id`/`max_id` pagination)
+  - Bluesky: `data/bluesky_mention_cursor.json` (newest notification URI marker)
 - Stores mentions in SQLite and processes unhandled rows.
 - If mention text matches patterns like "How are you?", Copierbot generates a local `system_log` style reply and posts it as a reply.
 - Other mentions are marked handled with `no_reply` so they are not repeatedly reprocessed.
@@ -275,6 +301,7 @@ copierbot/
     anonymize.py
     storage.py
     social/
+        bluesky_adapter.py
         mastodon_adapter.py
     config.py
     db/

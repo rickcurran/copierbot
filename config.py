@@ -17,7 +17,17 @@ class Settings:
     text_model: str = "gpt-4.1-mini"
     image_model: str = "gpt-image-1"
     post_mode: str = "default"
-    mastodon_max_chars: int = 500
+    mastodon_max_chars: int = 300
+    bluesky_max_chars: int = 300
+    enable_name_obfuscation: bool = False
+
+
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable using common truthy values."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 
 def get_settings(
@@ -53,12 +63,20 @@ def get_settings(
     if post_mode not in {"default", "mastodon"}:
         post_mode = "default"
 
-    max_chars_raw = os.getenv("MASTODON_MAX_CHARS", "500").strip()
+    max_chars_raw = os.getenv("MASTODON_MAX_CHARS", "300").strip()
     try:
         mastodon_max_chars = int(max_chars_raw)
     except ValueError:
-        mastodon_max_chars = 500
+        mastodon_max_chars = 300
     mastodon_max_chars = max(100, min(mastodon_max_chars, 5000))
+
+    bluesky_max_chars_raw = os.getenv("BLUESKY_MAX_CHARS", "300").strip()
+    try:
+        bluesky_max_chars = int(bluesky_max_chars_raw)
+    except ValueError:
+        bluesky_max_chars = 300
+    bluesky_max_chars = max(100, min(bluesky_max_chars, 5000))
+    enable_name_obfuscation = _get_bool_env("ENABLE_NAME_OBFUSCATION", default=False)
 
     return Settings(
         openai_api_key=openai_api_key,
@@ -67,4 +85,6 @@ def get_settings(
         news_page_size=max(10, min(news_page_size, 100)),
         post_mode=post_mode,
         mastodon_max_chars=mastodon_max_chars,
+        bluesky_max_chars=bluesky_max_chars,
+        enable_name_obfuscation=enable_name_obfuscation,
     )

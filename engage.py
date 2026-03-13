@@ -13,6 +13,7 @@ from typing import Any
 from config import get_settings
 from mention_archive import save_mention_response_log
 from persona import get_persona_context
+from social.bluesky_adapter import BlueskyAPIError, BlueskyAdapter, load_bluesky_config
 from social.mastodon_adapter import MastodonAPIError, MastodonAdapter, load_mastodon_config
 from storage import (
     create_reply_record,
@@ -25,7 +26,8 @@ from storage import (
 from system_log import generate_system_log_local
 
 
-MENTION_CURSOR_PATH = Path("data/mention_cursor.json")
+MASTODON_MENTION_CURSOR_PATH = Path("data/mention_cursor.json")
+BLUESKY_MENTION_CURSOR_PATH = Path("data/bluesky_mention_cursor.json")
 
 CHECKIN_PATTERNS = [
     re.compile(r"\bhow\s+(are|r)\s+you\b", re.IGNORECASE),
@@ -99,10 +101,10 @@ def _snowflake_min(values: list[str]) -> str:
     return min(candidates, key=lambda x: _safe_int(x) if _safe_int(x) is not None else 0)
 
 
-def _load_mention_cursor() -> str:
+def _load_mastodon_mention_cursor() -> str:
     """Load last processed Mastodon notification id cursor."""
     try:
-        raw = json.loads(MENTION_CURSOR_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(MASTODON_MENTION_CURSOR_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return ""
     if not isinstance(raw, dict):
@@ -111,11 +113,29 @@ def _load_mention_cursor() -> str:
     return cursor
 
 
-def _save_mention_cursor(cursor: str) -> None:
+def _save_mastodon_mention_cursor(cursor: str) -> None:
     """Persist last processed Mastodon notification id cursor."""
-    MENTION_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MASTODON_MENTION_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {"last_notification_id": (cursor or "").strip()}
-    MENTION_CURSOR_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    MASTODON_MENTION_CURSOR_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _load_bluesky_mention_cursor() -> str:
+    """Load last seen Bluesky notification post URI marker."""
+    try:
+        raw = json.loads(BLUESKY_MENTION_CURSOR_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    return str(raw.get("last_notification_uri", "")).strip()
+
+
+def _save_bluesky_mention_cursor(notification_uri: str) -> None:
+    """Persist newest seen Bluesky notification post URI marker."""
+    BLUESKY_MENTION_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_notification_uri": (notification_uri or "").strip()}
+    BLUESKY_MENTION_CURSOR_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _extract_mention_payload(notification: dict[str, Any], self_account_id: str) -> dict[str, str] | None:
@@ -149,6 +169,42 @@ def _extract_mention_payload(notification: dict[str, Any], self_account_id: str)
         "author": author,
         "text": content_text,
         "source_created_at": str(status.get("created_at", "")).strip(),
+    }
+
+
+def _extract_bluesky_mention_payload(
+    notification: dict[str, Any], self_did: str
+) -> dict[str, str] | None:
+    """Extract mention/reply fields from one Bluesky notification payload."""
+    reason = str(notification.get("reason", "")).strip().lower()
+    if reason not in {"mention", "reply"}:
+        return None
+
+    mention_uri = str(notification.get("uri", "")).strip()
+    if not mention_uri:
+        return None
+
+    author_payload = notification.get("author")
+    if not isinstance(author_payload, dict):
+        return None
+
+    author_did = str(author_payload.get("did", "")).strip()
+    if self_did and author_did and author_did == self_did:
+        return None
+
+    author_handle = str(author_payload.get("handle", "")).strip().lstrip("@")
+    author = f"@{author_handle}" if author_handle else ""
+
+    record_payload = notification.get("record")
+    text = ""
+    if isinstance(record_payload, dict):
+        text = str(record_payload.get("text", "")).strip()
+
+    return {
+        "mention_id": mention_uri,
+        "author": author,
+        "text": text,
+        "source_created_at": str(notification.get("indexedAt", "")).strip(),
     }
 
 
@@ -193,9 +249,11 @@ def _build_reply_text(
     return reply
 
 
-def ingest_mentions(adapter: MastodonAdapter, self_account_id: str, fetch_limit: int = 20) -> int:
-    """Fetch mention notifications and upsert them into local storage."""
-    since_id = _load_mention_cursor()
+def ingest_mastodon_mentions(
+    adapter: MastodonAdapter, self_account_id: str, fetch_limit: int = 20
+) -> int:
+    """Fetch Mastodon mention notifications and upsert them into local storage."""
+    since_id = _load_mastodon_mention_cursor()
     max_id = ""
     seen_notification_ids: set[str] = set()
     inserted = 0
@@ -243,12 +301,68 @@ def ingest_mentions(adapter: MastodonAdapter, self_account_id: str, fetch_limit:
         max_id = oldest_notification_id
 
     if highest_notification_id and highest_notification_id != since_id:
-        _save_mention_cursor(highest_notification_id)
+        _save_mastodon_mention_cursor(highest_notification_id)
 
     return inserted
 
 
-def process_unhandled_mentions(
+def ingest_bluesky_mentions(adapter: BlueskyAdapter, self_did: str, fetch_limit: int = 50) -> int:
+    """Fetch Bluesky mention/reply notifications and upsert them into local storage."""
+    last_seen_uri = _load_bluesky_mention_cursor()
+    cursor = ""
+    inserted = 0
+    newest_uri = ""
+    reached_seen = False
+
+    # Page newest -> older until we hit previously seen marker.
+    for _ in range(10):
+        payload = adapter.list_notifications(
+            reasons=["mention", "reply"],
+            limit=max(1, min(fetch_limit, 100)),
+            cursor=cursor,
+        )
+        notifications = payload.get("notifications")
+        if not isinstance(notifications, list) or not notifications:
+            break
+
+        first_uri = str((notifications[0] or {}).get("uri", "")).strip()
+        if first_uri and not newest_uri:
+            newest_uri = first_uri
+
+        for notification in notifications:
+            if not isinstance(notification, dict):
+                continue
+            notification_uri = str(notification.get("uri", "")).strip()
+            if last_seen_uri and notification_uri and notification_uri == last_seen_uri:
+                reached_seen = True
+                break
+
+            mention = _extract_bluesky_mention_payload(notification, self_did=self_did)
+            if mention is None:
+                continue
+            upsert_mention(
+                platform="bluesky",
+                mention_id=mention["mention_id"],
+                author=mention["author"],
+                text=mention["text"],
+                source_created_at=mention["source_created_at"],
+            )
+            inserted += 1
+
+        if reached_seen:
+            break
+
+        cursor = str(payload.get("cursor", "")).strip()
+        if not cursor:
+            break
+
+    if newest_uri and newest_uri != last_seen_uri:
+        _save_bluesky_mention_cursor(newest_uri)
+
+    return inserted
+
+
+def process_unhandled_mastodon_mentions(
     *,
     adapter: MastodonAdapter,
     persona_context: str,
@@ -348,15 +462,120 @@ def process_unhandled_mentions(
     return stats
 
 
+def process_unhandled_bluesky_mentions(
+    *,
+    adapter: BlueskyAdapter,
+    persona_context: str,
+    max_chars: int,
+    process_limit: int = 20,
+) -> dict[str, int]:
+    """Process queued Bluesky mentions/replies and optionally post system-log replies."""
+    stats = {
+        "seen_unhandled": 0,
+        "replied": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+    mentions = list_unhandled_mentions(platform="bluesky", limit=process_limit)
+    for mention in mentions:
+        stats["seen_unhandled"] += 1
+        mention_row_id = int(mention["id"])
+        mention_id = str(mention.get("mention_id", "")).strip()
+        mention_author = str(mention.get("author", "")).strip()
+        mention_text = str(mention.get("text", "")).strip()
+
+        classification, decision = _classify_mention_text(mention_text)
+        if decision != "reply_system_log":
+            mark_mention_handled(
+                mention_row_id=mention_row_id,
+                classification=classification,
+                decision=decision,
+            )
+            stats["skipped"] += 1
+            continue
+
+        reply_row_id: int | None = None
+        try:
+            reply_text = _build_reply_text(
+                persona_context=persona_context,
+                max_chars=max_chars,
+            )
+            reply_row_id = create_reply_record(
+                mention_row_id=mention_row_id,
+                decision=decision,
+                status="sending",
+                reply_text=reply_text,
+                platform="bluesky",
+            )
+            payload = adapter.reply_to_post(
+                parent_uri=mention_id,
+                text=reply_text,
+            )
+            remote_reply_id = str(payload.get("uri", "")).strip()
+            remote_reply_url = str(payload.get("url", "")).strip()
+            update_reply_record(
+                reply_row_id=reply_row_id,
+                status="sent",
+                remote_reply_id=remote_reply_id,
+            )
+            mention_log_path = save_mention_response_log(
+                mention_id=mention_id,
+                author=mention_author,
+                original_text=mention_text,
+                reply_text=reply_text,
+                response_url=remote_reply_url,
+            )
+            logging.info("Saved Bluesky mention response log to %s", mention_log_path)
+            mark_mention_handled(
+                mention_row_id=mention_row_id,
+                classification=classification,
+                decision="replied_system_log",
+            )
+            stats["replied"] += 1
+            logging.info(
+                "Replied to Bluesky mention %s from %s%s",
+                mention_id,
+                mention_author or "unknown",
+                f" -> {remote_reply_url}" if remote_reply_url else "",
+            )
+        except Exception as exc:
+            if reply_row_id is None:
+                create_reply_record(
+                    mention_row_id=mention_row_id,
+                    decision=decision,
+                    status="failed",
+                    reply_text="",
+                    platform="bluesky",
+                    error=str(exc),
+                )
+            else:
+                update_reply_record(
+                    reply_row_id=reply_row_id,
+                    status="failed",
+                    error=str(exc),
+                )
+            stats["failed"] += 1
+            logging.error("Failed replying to Bluesky mention %s: %s", mention_id, exc)
+
+    return stats
+
+
 def run() -> None:
     """CLI entrypoint for mention ingestion and reply handling."""
     _setup_logging()
-    parser = argparse.ArgumentParser(description="Process Mastodon mentions for Copierbot.")
+    parser = argparse.ArgumentParser(description="Process Mastodon/Bluesky mentions for Copierbot.")
+    parser.add_argument(
+        "--platform",
+        default="all",
+        choices=["mastodon", "bluesky", "all"],
+        help="Mention source platform(s) to process.",
+    )
     parser.add_argument(
         "--fetch-limit",
         type=int,
         default=40,
-        help="Per-page notifications fetch size from Mastodon (1-80).",
+        help="Per-page notifications fetch size (Mastodon 1-80, Bluesky 1-100).",
     )
     parser.add_argument(
         "--process-limit",
@@ -367,48 +586,85 @@ def run() -> None:
     args = parser.parse_args()
 
     settings = get_settings(require_news_api_key=False, require_openai_api_key=False)
-    mastodon_config = load_mastodon_config(required=True)
-    assert mastodon_config is not None
-
     init_storage()
-    adapter = MastodonAdapter(mastodon_config)
-    account = adapter.verify_account()
-    self_account_id = str(account.get("id", "")).strip()
-
     persona_context = get_persona_context()
+    targets = ["mastodon", "bluesky"] if args.platform == "all" else [args.platform]
 
-    instance_limit = adapter.get_instance_max_characters(fallback=settings.mastodon_max_chars)
-    if settings.post_mode == "mastodon":
-        max_chars = min(instance_limit, settings.mastodon_max_chars)
-    else:
-        max_chars = instance_limit
+    ran_any = False
+    for platform in targets:
+        if platform == "mastodon":
+            mastodon_config = load_mastodon_config(required=False)
+            if mastodon_config is None:
+                logging.warning("Skipping Mastodon mention processing: config not set.")
+                continue
+            adapter = MastodonAdapter(mastodon_config)
+            account = adapter.verify_account()
+            self_account_id = str(account.get("id", "")).strip()
+            instance_limit = adapter.get_instance_max_characters(fallback=settings.mastodon_max_chars)
+            max_chars = min(instance_limit, settings.mastodon_max_chars)
 
-    ingested = ingest_mentions(
-        adapter=adapter,
-        self_account_id=self_account_id,
-        fetch_limit=max(1, min(args.fetch_limit, 80)),
-    )
-    stats = process_unhandled_mentions(
-        adapter=adapter,
-        persona_context=persona_context,
-        max_chars=max_chars,
-        process_limit=max(1, args.process_limit),
-    )
+            ingested = ingest_mastodon_mentions(
+                adapter=adapter,
+                self_account_id=self_account_id,
+                fetch_limit=max(1, min(args.fetch_limit, 80)),
+            )
+            stats = process_unhandled_mastodon_mentions(
+                adapter=adapter,
+                persona_context=persona_context,
+                max_chars=max_chars,
+                process_limit=max(1, args.process_limit),
+            )
+            logging.info(
+                "Mastodon mention processing complete: ingested=%d, seen_unhandled=%d, replied=%d, skipped=%d, failed=%d",
+                ingested,
+                stats["seen_unhandled"],
+                stats["replied"],
+                stats["skipped"],
+                stats["failed"],
+            )
+            ran_any = True
+            continue
 
-    logging.info(
-        "Mention processing complete: ingested=%d, seen_unhandled=%d, replied=%d, skipped=%d, failed=%d",
-        ingested,
-        stats["seen_unhandled"],
-        stats["replied"],
-        stats["skipped"],
-        stats["failed"],
-    )
+        if platform == "bluesky":
+            bluesky_config = load_bluesky_config(required=False)
+            if bluesky_config is None:
+                logging.warning("Skipping Bluesky mention processing: config not set.")
+                continue
+            adapter = BlueskyAdapter(bluesky_config)
+            account = adapter.verify_account()
+            self_did = str(account.get("did", "")).strip()
+            max_chars = min(adapter.get_instance_max_characters(), settings.bluesky_max_chars)
+
+            ingested = ingest_bluesky_mentions(
+                adapter=adapter,
+                self_did=self_did,
+                fetch_limit=max(1, min(args.fetch_limit, 100)),
+            )
+            stats = process_unhandled_bluesky_mentions(
+                adapter=adapter,
+                persona_context=persona_context,
+                max_chars=max_chars,
+                process_limit=max(1, args.process_limit),
+            )
+            logging.info(
+                "Bluesky mention processing complete: ingested=%d, seen_unhandled=%d, replied=%d, skipped=%d, failed=%d",
+                ingested,
+                stats["seen_unhandled"],
+                stats["replied"],
+                stats["skipped"],
+                stats["failed"],
+            )
+            ran_any = True
+            continue
+
+    if not ran_any:
+        raise ValueError("No mention platforms could be processed. Check platform configs.")
 
 
 if __name__ == "__main__":
     try:
         run()
-    except (ValueError, RuntimeError, MastodonAPIError) as exc:
+    except (ValueError, RuntimeError, MastodonAPIError, BlueskyAPIError) as exc:
         logging.basicConfig(level=logging.ERROR, format="%(levelname)s | %(message)s")
         logging.error("Mention processor failed: %s", exc)
         raise SystemExit(1)

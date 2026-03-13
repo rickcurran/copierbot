@@ -123,7 +123,7 @@ def _load_mono_font(size: int = 18) -> ImageFont.ImageFont:
 def create_ascii_fallback_image(
     output_path: Path, headline: str, persona_context: str, error_message: str
 ) -> str:
-    """Create a local fallback PNG with ASCII art and return the ASCII text."""
+    """Create a local fallback image with ASCII art and return the ASCII text."""
     ascii_text = _build_ascii_log(headline=headline, persona_context=persona_context, error_message=error_message)
 
     image = Image.new("RGB", (1024, 1024), color=(244, 241, 233))
@@ -135,5 +135,9 @@ def create_ascii_fallback_image(
     draw.multiline_text((44, 44), ascii_text, fill=(22, 22, 22), font=font, spacing=5)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG")
+    suffix = output_path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        image.save(output_path, format="JPEG", quality=92, optimize=True, progressive=True)
+    else:
+        image.save(output_path, format="PNG")
     return ascii_text

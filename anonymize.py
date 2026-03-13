@@ -32,6 +32,179 @@ ORG_HINTS = {
     "Daily",
 }
 
+# Common non-person tokens that frequently appear in tech/product headlines.
+NON_PERSON_TOKENS = {
+    "Apple",
+    "Google",
+    "Play",
+    "Store",
+    "Android",
+    "iPhone",
+    "iPad",
+    "Mac",
+    "MacBook",
+    "Microsoft",
+    "Windows",
+    "Xbox",
+    "Sony",
+    "PlayStation",
+    "Nintendo",
+    "Steam",
+    "Valve",
+    "Meta",
+    "Instagram",
+    "Facebook",
+    "WhatsApp",
+    "Threads",
+    "OpenAI",
+    "ChatGPT",
+    "Anthropic",
+    "Claude",
+    "Amazon",
+    "AWS",
+    "Prime",
+    "Tesla",
+    "Nvidia",
+    "Intel",
+    "AMD",
+    "Samsung",
+    "TikTok",
+    "YouTube",
+    "Netflix",
+    "Disney",
+    "Spotify",
+    "GitHub",
+    "Reddit",
+    "Zoom",
+    "Slack",
+    "Cloudflare",
+    "Oracle",
+    "Salesforce",
+}
+
+# Conservative first-name hints used to reduce false positives.
+FIRST_NAME_HINTS = {
+    "Aaron",
+    "Adam",
+    "Aisha",
+    "Alan",
+    "Alex",
+    "Alice",
+    "Amina",
+    "Andrew",
+    "Angela",
+    "Anna",
+    "Anthony",
+    "Ava",
+    "Ben",
+    "Benjamin",
+    "Brian",
+    "Carla",
+    "Carlos",
+    "Catherine",
+    "Charlie",
+    "Chris",
+    "Daniel",
+    "David",
+    "Diana",
+    "Emily",
+    "Emma",
+    "Eric",
+    "Ethan",
+    "Fatima",
+    "Francesca",
+    "Gabriel",
+    "Grace",
+    "Hannah",
+    "Harper",
+    "Henry",
+    "Isabella",
+    "Jack",
+    "Jacob",
+    "James",
+    "Jason",
+    "Jennifer",
+    "Jessica",
+    "John",
+    "Jonathan",
+    "Jordan",
+    "Joseph",
+    "Joshua",
+    "Julia",
+    "Karen",
+    "Kevin",
+    "Liam",
+    "Linda",
+    "Lisa",
+    "Lucas",
+    "Maya",
+    "Michael",
+    "Michelle",
+    "Mohamed",
+    "Muhammad",
+    "Natalie",
+    "Noah",
+    "Olivia",
+    "Omar",
+    "Patricia",
+    "Paul",
+    "Peter",
+    "Priya",
+    "Rahul",
+    "Richard",
+    "Robert",
+    "Ryan",
+    "Samantha",
+    "Sara",
+    "Sarah",
+    "Scott",
+    "Sofia",
+    "Sophia",
+    "Stefan",
+    "Stephen",
+    "Steven",
+    "Sundar",
+    "Thomas",
+    "Tim",
+    "Victoria",
+    "William",
+    "Yusuf",
+    "Zohran",
+    "Zoe",
+}
+
+PERSON_TITLE_TOKENS = {
+    "mr",
+    "mrs",
+    "ms",
+    "miss",
+    "mx",
+    "dr",
+    "prof",
+    "professor",
+    "president",
+    "mayor",
+    "senator",
+    "governor",
+    "ceo",
+    "founder",
+    "actor",
+    "actress",
+    "singer",
+    "director",
+    "coach",
+}
+
+PERSON_TITLE_HINT_RE = re.compile(
+    r"(?:^|\W)(mr|mrs|ms|miss|mx|dr|prof|professor|president|prime minister|pm|mayor|senator|governor|ceo|founder|actor|actress|singer|director|coach)\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_token(token: str) -> str:
+    """Normalize token for set membership checks."""
+    return re.sub(r"[^A-Za-z]", "", token)
+
 
 def _safe_mutate_token(token: str) -> str:
     """Generate a neutral pseudonym-style misspelling for one token."""
@@ -82,13 +255,31 @@ def _safe_mutate_token(token: str) -> str:
 
 
 def _looks_like_person_name(candidate: str) -> bool:
-    """Heuristic filter for person-like names."""
+    """Conservative heuristic filter for person-like names."""
     tokens = candidate.split()
     if len(tokens) < 2:
         return False
-    if any(token in ORG_HINTS for token in tokens):
+
+    cleaned = [_clean_token(token) for token in tokens]
+    if any(not token for token in cleaned):
         return False
-    return True
+    if any(token in ORG_HINTS for token in cleaned):
+        return False
+    if any(token in NON_PERSON_TOKENS for token in cleaned):
+        return False
+    if any(token.isupper() and len(token) > 1 for token in cleaned):
+        return False
+
+    has_title_token = cleaned[0].lower() in PERSON_TITLE_TOKENS
+    if has_title_token:
+        return True
+
+    # Keep this conservative for 2-token phrases to avoid brand/product false positives.
+    if len(cleaned) == 2:
+        return cleaned[0] in FIRST_NAME_HINTS
+
+    # 3-token sequences often include middle names/initial-like structures.
+    return cleaned[0] in FIRST_NAME_HINTS or cleaned[1] in FIRST_NAME_HINTS
 
 
 def anonymize_headline_names(headline: str) -> str:
@@ -96,10 +287,18 @@ def anonymize_headline_names(headline: str) -> str:
 
     def _replace(match: re.Match[str]) -> str:
         full_name = match.group(0)
-        if not _looks_like_person_name(full_name):
+        # If directly preceded by a human-title hint, treat as a person even if uncommon.
+        prefix = headline[max(0, match.start() - 40) : match.start()]
+        title_hint = bool(PERSON_TITLE_HINT_RE.search(prefix))
+        if not title_hint and not _looks_like_person_name(full_name):
             return full_name
         parts = full_name.split()
-        mutated_parts = [_safe_mutate_token(part) for part in parts]
+        cleaned_parts = [_clean_token(part) for part in parts]
+        if cleaned_parts and cleaned_parts[0].lower() in PERSON_TITLE_TOKENS:
+            # Preserve title token, mutate only the actual name.
+            mutated_parts = [parts[0]] + [_safe_mutate_token(part) for part in parts[1:]]
+        else:
+            mutated_parts = [_safe_mutate_token(part) for part in parts]
         return " ".join(mutated_parts)
 
     return NAME_PATTERN.sub(_replace, headline)

@@ -39,6 +39,24 @@ def _build_final_prompt(prompt: str, strict_safety: bool) -> str:
     return f"{prompt}. Style: {STYLE_INSTRUCTIONS}. Safety constraints: {SAFETY_GUARDRAILS}.{strict_suffix}"
 
 
+def _save_image_for_path(image: Image.Image, output_path: Path) -> None:
+    """Save image based on output extension (JPG default, PNG fallback)."""
+    suffix = output_path.suffix.lower()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if suffix in {".jpg", ".jpeg"}:
+        if image.mode == "RGBA":
+            bg = Image.new("RGBA", image.size, (255, 255, 255, 255))
+            bg.alpha_composite(image)
+            image = bg.convert("RGB")
+        else:
+            image = image.convert("RGB")
+        image.save(output_path, format="JPEG", quality=92, optimize=True, progressive=True)
+        return
+
+    image.save(output_path, format="PNG")
+
+
 def generate_image(client: OpenAI, model: str, prompt: str, output_path: Path) -> str:
     """Generate a 1024x1024 image with OpenAI and save it to disk."""
     final_prompt = _build_final_prompt(prompt, strict_safety=False)
@@ -76,8 +94,7 @@ def generate_image(client: OpenAI, model: str, prompt: str, output_path: Path) -
 
     try:
         image = Image.open(BytesIO(raw_bytes))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(output_path, format="PNG")
+        _save_image_for_path(image=image, output_path=output_path)
     except Exception as exc:
         raise RuntimeError(f"Failed to save image to disk: {exc}") from exc
 

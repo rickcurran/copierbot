@@ -35,6 +35,8 @@ URL_RE = re.compile(r"https?://[^\s<>'\"]+")
 
 GENERATE_INTERVAL_HOURS = list(range(1, 25))
 MENTION_INTERVAL_MINUTES = [1, 5, 10, 15, 20, 30, 60]
+PUBLISH_PLATFORM_OPTIONS = ("mastodon", "bluesky")
+DEFAULT_ACTIVE_PUBLISH_PLATFORMS = ["mastodon"]
 
 
 @dataclass
@@ -83,6 +85,7 @@ SCHEDULERS: dict[str, SchedulerState] = {
         interval_seconds=5 * 60,
     ),
 }
+ACTIVE_PUBLISH_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS)
 
 
 def _validate_generate_interval_seconds(value: int) -> int:
@@ -101,11 +104,50 @@ def _validate_mentions_interval_seconds(value: int) -> int:
     return minutes * 60
 
 
-def _load_scheduler_preferences() -> dict[str, int]:
+def _normalize_active_publish_platforms(raw_value: object) -> list[str]:
+    """Normalize persisted platform preference value."""
+    values: list[str] = []
+    if isinstance(raw_value, str):
+        values = [part.strip().lower() for part in raw_value.split(",")]
+    elif isinstance(raw_value, list):
+        values = [str(part).strip().lower() for part in raw_value]
+
+    deduped: list[str] = []
+    for value in values:
+        if value in PUBLISH_PLATFORM_OPTIONS and value not in deduped:
+            deduped.append(value)
+    return deduped or list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS)
+
+
+def _active_platform_arg(platforms: list[str]) -> str:
+    """Convert active platforms list to orchestrator --platform argument."""
+    normalized = _normalize_active_publish_platforms(platforms)
+    if len(normalized) == 2:
+        return "all"
+    return normalized[0]
+
+
+def _get_active_publish_platforms() -> list[str]:
+    """Return current active publish platforms (copy)."""
+    with SCHED_LOCK:
+        return list(ACTIVE_PUBLISH_PLATFORMS)
+
+
+def _set_active_publish_platforms(platforms: list[str]) -> None:
+    """Update active publish platforms and persist preferences."""
+    normalized = _normalize_active_publish_platforms(platforms)
+    with SCHED_LOCK:
+        ACTIVE_PUBLISH_PLATFORMS.clear()
+        ACTIVE_PUBLISH_PLATFORMS.extend(normalized)
+        _save_scheduler_preferences()
+
+
+def _load_scheduler_preferences() -> dict[str, object]:
     """Load persisted scheduler interval preferences."""
     defaults = {
         "generate_publish_interval_seconds": 3600,
         "mentions_interval_seconds": 300,
+        "active_publish_platforms": list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS),
     }
     try:
         raw = json.loads(SCHED_PREFS_PATH.read_text(encoding="utf-8"))
@@ -136,6 +178,9 @@ def _load_scheduler_preferences() -> dict[str, int]:
                 defaults["mentions_interval_seconds"],
             )
         ),
+        "active_publish_platforms": _normalize_active_publish_platforms(
+            raw.get("active_publish_platforms", defaults["active_publish_platforms"])
+        ),
     }
 
 
@@ -144,6 +189,7 @@ def _save_scheduler_preferences() -> None:
     payload = {
         "generate_publish_interval_seconds": int(SCHEDULERS["generate_publish"].interval_seconds),
         "mentions_interval_seconds": int(SCHEDULERS["mentions"].interval_seconds),
+        "active_publish_platforms": list(ACTIVE_PUBLISH_PLATFORMS),
     }
     SCHED_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SCHED_PREFS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -152,8 +198,12 @@ def _save_scheduler_preferences() -> None:
 def _apply_scheduler_preferences() -> None:
     """Apply persisted preferences to in-memory scheduler defaults."""
     prefs = _load_scheduler_preferences()
-    SCHEDULERS["generate_publish"].interval_seconds = prefs["generate_publish_interval_seconds"]
-    SCHEDULERS["mentions"].interval_seconds = prefs["mentions_interval_seconds"]
+    SCHEDULERS["generate_publish"].interval_seconds = int(prefs["generate_publish_interval_seconds"])
+    SCHEDULERS["mentions"].interval_seconds = int(prefs["mentions_interval_seconds"])
+    ACTIVE_PUBLISH_PLATFORMS.clear()
+    ACTIVE_PUBLISH_PLATFORMS.extend(
+        _normalize_active_publish_platforms(prefs.get("active_publish_platforms"))
+    )
 
 
 _apply_scheduler_preferences()
@@ -221,29 +271,39 @@ def _parse_run_manifest(manifest_path: Path) -> list[Path]:
     return result
 
 
-def _latest_published_post_time() -> datetime | None:
-    """Return latest Mastodon publish time from storage, localized."""
+def _latest_published_post_time(active_platforms: list[str]) -> datetime | None:
+    """Return latest publish time for selected platforms, localized."""
     try:
         init_storage()
-        rows = list_published_posts(platform="mastodon", limit=1)
+        rows = list_published_posts(platform=None, limit=80)
     except Exception:
         return None
     if not rows:
         return None
 
-    raw = str(rows[0].get("published_at", "")).strip()
-    if not raw:
-        return None
-    try:
-        parsed_utc = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-    return parsed_utc.astimezone()
+    active = set(_normalize_active_publish_platforms(active_platforms))
+    latest: datetime | None = None
+    for row in rows:
+        platform = str(row.get("platform", "")).strip().lower()
+        if platform not in active:
+            continue
+        raw = str(row.get("published_at", "")).strip()
+        if not raw:
+            continue
+        try:
+            parsed_local = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            ).astimezone()
+        except ValueError:
+            continue
+        if latest is None or parsed_local > latest:
+            latest = parsed_local
+    return latest
 
 
-def _compute_generate_initial_delay(interval_seconds: int) -> int:
+def _compute_generate_initial_delay(interval_seconds: int, active_platforms: list[str]) -> int:
     """Delay first generate cycle if a publish already happened within interval."""
-    latest = _latest_published_post_time()
+    latest = _latest_published_post_time(active_platforms=active_platforms)
     if latest is None:
         return 0
     elapsed = (_now_dt() - latest).total_seconds()
@@ -340,7 +400,8 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
         return [sys.executable, "main.py"]
 
     def _cmd_publish_latest(_: dict[str, str]) -> list[str]:
-        return [sys.executable, "orchestrator.py"]
+        platform_arg = _active_platform_arg(_get_active_publish_platforms())
+        return [sys.executable, "orchestrator.py", "--platform", platform_arg]
 
     def _cmd_publish_selected(payload: dict[str, str]) -> list[str] | None:
         run_dir = (payload.get("run_dir") or "").strip()
@@ -348,16 +409,32 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
             return None
         if not RUN_DIR_RE.match(run_dir):
             return None
-        return [sys.executable, "orchestrator.py", "--run-dir", f"output/{run_dir}"]
+        platform_arg = _active_platform_arg(_get_active_publish_platforms())
+        return [
+            sys.executable,
+            "orchestrator.py",
+            "--run-dir",
+            f"output/{run_dir}",
+            "--platform",
+            platform_arg,
+        ]
 
     def _cmd_mentions(_: dict[str, str]) -> list[str]:
         return [sys.executable, "engage.py"]
+
+    def _cmd_mentions_mastodon(_: dict[str, str]) -> list[str]:
+        return [sys.executable, "engage.py", "--platform", "mastodon"]
+
+    def _cmd_mentions_bluesky(_: dict[str, str]) -> list[str]:
+        return [sys.executable, "engage.py", "--platform", "bluesky"]
 
     return {
         "generate": ("Generate Post", _cmd_generate),
         "publish_latest": ("Publish Latest Run", _cmd_publish_latest),
         "publish_selected": ("Publish Selected Run", _cmd_publish_selected),
-        "check_mentions": ("Check Mentions", _cmd_mentions),
+        "check_mentions": ("Check Mentions (All)", _cmd_mentions),
+        "check_mentions_mastodon": ("Check Mentions (Mastodon)", _cmd_mentions_mastodon),
+        "check_mentions_bluesky": ("Check Mentions (Bluesky)", _cmd_mentions_bluesky),
     }
 
 
@@ -386,16 +463,20 @@ def _run_generate_publish_cycle() -> str:
         if not created:
             return "main.py succeeded; no run-manifest entries found."
 
+        active_platforms = _get_active_publish_platforms()
+        platform_arg = _active_platform_arg(active_platforms)
         published = 0
         publish_failed = 0
         for run_path in created:
             pub_job = _enqueue_job(
-                label=f"Scheduled Publish {run_path.name}",
+                label=f"Scheduled Publish {run_path.name} [{platform_arg}]",
                 command=[
                     sys.executable,
                     "orchestrator.py",
                     "--run-dir",
                     f"output/{run_path.name}",
+                    "--platform",
+                    platform_arg,
                 ],
                 background=False,
             )
@@ -405,8 +486,8 @@ def _run_generate_publish_cycle() -> str:
                 publish_failed += 1
 
         return (
-            f"generated_runs={len(created)} published={published} "
-            f"publish_failed={publish_failed}."
+            f"generated_runs={len(created)} platform={platform_arg} "
+            f"published={published} publish_failed={publish_failed}."
         )
     finally:
         try:
@@ -612,6 +693,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = {k: (v[0] if v else "") for k, v in form.items()}
         action = (payload.get("action") or "").strip()
 
+        if action == "update_publish_platforms":
+            selected = form.get("publish_platform", [])
+            _set_active_publish_platforms([str(item) for item in selected])
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
         actions = _build_actions()
         action_info = actions.get(action)
         if action_info is not None:
@@ -628,13 +717,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if hours not in GENERATE_INTERVAL_HOURS:
                 hours = 1
             interval_seconds = hours * 60 * 60
-            initial_delay_seconds = _compute_generate_initial_delay(interval_seconds)
+            active_platforms = _get_active_publish_platforms()
+            initial_delay_seconds = _compute_generate_initial_delay(
+                interval_seconds, active_platforms
+            )
             queued_message = "queued"
             if initial_delay_seconds > 0:
                 queued_message = (
                     "waiting "
                     f"{_format_wait_duration(initial_delay_seconds)}; "
-                    "recent publish detected."
+                    f"recent publish detected for {_active_platform_arg(active_platforms)}."
                 )
             _start_scheduler(
                 key="generate_publish",
@@ -694,6 +786,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         gp = sched["generate_publish"]
         mn = sched["mentions"]
+        active_platforms = _get_active_publish_platforms()
+        active_platform_arg = _active_platform_arg(active_platforms)
+        active_platforms_label = ", ".join(active_platforms)
         gp_hours_selected = max(1, int(gp["interval_seconds"]) // 3600)
         mn_mins_selected = max(1, int(mn["interval_seconds"]) // 60)
 
@@ -710,6 +805,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 f"Every {m} minute{'s' if m != 1 else ''}</option>"
             )
             for m in MENTION_INTERVAL_MINUTES
+        )
+        platform_options = "".join(
+            (
+                "<label style='display:flex;align-items:center;gap:0.5rem;margin:0.35rem 0;'>"
+                f"<input type='checkbox' name='publish_platform' value='{name}'"
+                f"{' checked' if name in active_platforms else ''} />"
+                f"<span>{name.title()}</span>"
+                "</label>"
+            )
+            for name in PUBLISH_PLATFORM_OPTIONS
         )
 
         body = f"""<!doctype html>
@@ -876,9 +981,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     <div class="grid">
       <div class="card">
+        <h2>Publish Destinations</h2>
+        <p class="hint">Choose active social platforms. Generate + Publish scheduler and manual publish actions will post to these destinations using one generated run.</p>
+        <p class="sched-meta">Active: {html.escape(active_platforms_label)} (orchestrator <code>--platform {html.escape(active_platform_arg)}</code>)</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="update_publish_platforms" />
+          {platform_options}
+          <button type="submit">Save Active Platforms</button>
+        </form>
+      </div>
+
+      <div class="card">
         <h2>Scheduler: Generate + Publish</h2>
-        <p class="hint">Runs <code>main.py</code>, then publishes all new run folders from that cycle in creation order (normal post first, phase-change post second when present).</p>
+        <p class="hint">Runs <code>main.py</code>, then publishes all new run folders from that cycle in creation order (normal post first, phase-change post second when present) to active destinations.</p>
         <div class="sched-status {'running' if bool(gp['running']) else 'stopped'}">{'running' if bool(gp['running']) else 'stopped'}</div>
+        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
         <p class="sched-meta">Last run: {html.escape(str(gp['last_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Next run: {html.escape(str(gp['next_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Last result: {html.escape(str(gp['last_result']) or 'N/A')}</p>
@@ -924,7 +1041,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
       <div class="card">
         <h2>Publish Latest</h2>
-        <p class="hint">Runs <code>orchestrator.py</code> to publish the newest generated run to Mastodon.</p>
+        <p class="hint">Runs <code>orchestrator.py</code> to publish the newest generated run to active destinations.</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="publish_latest" />
           <button type="submit">Run orchestrator.py</button>
@@ -933,16 +1051,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
       <div class="card">
         <h2>Check Mentions</h2>
-        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins.</p>
+        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins. Use All Platforms or run one platform only.</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="check_mentions" />
-          <button type="submit">Run engage.py</button>
+          <button type="submit">Check Mentions (All Platforms)</button>
+        </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="check_mentions_mastodon" />
+          <button type="submit">Check Mentions (Mastodon)</button>
+        </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="check_mentions_bluesky" />
+          <button type="submit">Check Mentions (Bluesky)</button>
         </form>
       </div>
 
       <div class="card">
         <h2>Publish Specific Run</h2>
-        <p class="hint">Select a run folder, then publish only that specific output instead of the latest one.</p>
+        <p class="hint">Select a run folder, then publish only that specific output instead of the latest one, to active destinations.</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="publish_selected" />
           <select name="run_dir">{run_options}</select>
