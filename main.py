@@ -19,6 +19,7 @@ from image_gen import generate_image
 from news import choose_headline, get_headlines
 from persona import get_persona_context, get_persona_state, increment_post_counter
 from phase_event import save_phase_change_system_log
+from social_posting import disclosure_overhead_chars
 from system_log import generate_system_log
 from system_log_card import card_path_for_system_log, render_system_log_card
 from title_gen import generate_title
@@ -29,7 +30,8 @@ OUTPUT_DIR = Path("output")
 
 def get_generation_char_limit(settings) -> int:
     """Return cross-platform max chars for generated post text."""
-    return min(settings.mastodon_max_chars, settings.bluesky_max_chars)
+    platform_limit = min(settings.mastodon_max_chars, settings.bluesky_max_chars)
+    return max(80, platform_limit - disclosure_overhead_chars())
 
 
 def setup_logging() -> None:
@@ -239,10 +241,11 @@ def run(run_manifest_path: Path | None = None) -> None:
     logging.info("Persona context loaded.")
     logging.info("Post mode: %s", settings.post_mode)
     logging.info(
-        "Generation char limit: %d (min of Mastodon=%d, Bluesky=%d)",
+        "Generation char limit: %d (min of Mastodon=%d, Bluesky=%d minus disclosure overhead=%d)",
         get_generation_char_limit(settings),
         settings.mastodon_max_chars,
         settings.bluesky_max_chars,
+        disclosure_overhead_chars(),
     )
 
     post_type = choose_post_type()

@@ -238,9 +238,11 @@ python orchestrator.py --platform all
 Publish behavior:
 
 - Uses idempotent job tracking in SQLite (`data/copierbot.db`) to avoid duplicate posts.
-- News run: uploads image + posts caption text.
+- News run: uploads caption text plus a publish-time composited social image (`social_image  <timestamp>.jpg`) built from `assets/templates/system_log_card.png` with the generated image placed in the 1000x1000 square area at `(x=40, y=50)` within a 1080x1080 template.
 - System log run: posts system-log text only.
 - `--platform` options: `mastodon` (default), `bluesky`, or `all`.
+- On publish, Copierbot appends an AI disclosure line to post text for Mastodon and Bluesky.
+- Disclosure is appended at publish time only (caption/system_log output files remain unchanged).
 
 ## Monitor Mentions And Reply
 
@@ -299,6 +301,7 @@ copierbot/
     caption.py
     title_gen.py
     anonymize.py
+    social_image.py
     storage.py
     social/
         bluesky_adapter.py

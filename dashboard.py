@@ -420,7 +420,8 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
         ]
 
     def _cmd_mentions(_: dict[str, str]) -> list[str]:
-        return [sys.executable, "engage.py"]
+        platform_arg = _active_platform_arg(_get_active_publish_platforms())
+        return [sys.executable, "engage.py", "--platform", platform_arg]
 
     def _cmd_mentions_mastodon(_: dict[str, str]) -> list[str]:
         return [sys.executable, "engage.py", "--platform", "mastodon"]
@@ -498,14 +499,15 @@ def _run_generate_publish_cycle() -> str:
 
 def _run_mention_cycle() -> str:
     """Run one scheduled mention-monitor cycle."""
+    platform_arg = _active_platform_arg(_get_active_publish_platforms())
     job = _enqueue_job(
         label="Scheduled Mention Check",
-        command=[sys.executable, "engage.py"],
+        command=[sys.executable, "engage.py", "--platform", platform_arg],
         background=False,
     )
     if job.status == "succeeded":
-        return "engage.py completed successfully."
-    return f"engage.py failed (rc={job.return_code})."
+        return f"engage.py completed successfully (platform={platform_arg})."
+    return f"engage.py failed (platform={platform_arg}, rc={job.return_code})."
 
 
 def _scheduler_loop(
@@ -1051,7 +1053,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
       <div class="card">
         <h2>Check Mentions</h2>
-        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins. Use All Platforms or run one platform only.</p>
+        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins. "All Platforms" follows active publish destinations.</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="check_mentions" />
           <button type="submit">Check Mentions (All Platforms)</button>

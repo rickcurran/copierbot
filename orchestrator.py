@@ -8,7 +8,9 @@ from pathlib import Path
 import re
 
 from social.bluesky_adapter import BlueskyAdapter, BlueskyAPIError, load_bluesky_config
+from social_image import build_social_composite_image
 from social.mastodon_adapter import MastodonAdapter, MastodonAPIError, load_mastodon_config
+from social_posting import append_ai_disclosure
 from storage import (
     create_post_job,
     find_post_job_by_idempotency_key,
@@ -67,6 +69,15 @@ def _image_mime_type(path: Path) -> str:
     if suffix == ".webp":
         return "image/webp"
     return "image/png"
+
+
+def _social_upload_image_or_original(image_path: Path) -> Path:
+    """Return composited social image when possible, else original image."""
+    try:
+        return build_social_composite_image(image_path)
+    except Exception as exc:
+        logging.warning("Failed to build social composite image, using original: %s", exc)
+        return image_path
 
 
 def _read_text_file(path: Path) -> str:
@@ -148,12 +159,13 @@ def _publish_run_directory_mastodon(
             if system_log_path is None:
                 raise RuntimeError("System log post selected but no system_log file found.")
             status_text = _read_text_file(system_log_path)
-            if len(status_text) > max_chars:
+            publish_text = append_ai_disclosure(status_text)
+            if len(publish_text) > max_chars:
                 raise RuntimeError(
-                    f"Status text length {len(status_text)} exceeds Mastodon limit {max_chars}."
+                    f"Status text length {len(publish_text)} exceeds Mastodon limit {max_chars}."
                 )
             status_payload = adapter.publish_status(
-                status=status_text,
+                status=publish_text,
                 visibility=visibility,
                 idempotency_key=idempotency_key,
             )
@@ -174,23 +186,25 @@ def _publish_run_directory_mastodon(
             prompt_text = _read_text_file(prompt_path) if prompt_path else ""
             generated_title = _extract_title_from_prompt(prompt_text)
             status_text = _strip_title_from_caption(caption_text, generated_title)
-            if len(status_text) > max_chars:
+            publish_text = append_ai_disclosure(status_text)
+            if len(publish_text) > max_chars:
                 raise RuntimeError(
-                    f"Status text length {len(status_text)} exceeds Mastodon limit {max_chars}."
+                    f"Status text length {len(publish_text)} exceeds Mastodon limit {max_chars}."
                 )
             media_ids: list[str] = []
             if image_path is not None:
+                upload_image_path = _social_upload_image_or_original(image_path)
                 media = adapter.upload_media(
-                    file_path=image_path,
+                    file_path=upload_image_path,
                     description="Copierbot surreal collage artwork",
-                    mime_type=_image_mime_type(image_path),
+                    mime_type=_image_mime_type(upload_image_path),
                 )
                 media_id = str(media.get("id", "")).strip()
                 if media_id:
                     media_ids.append(media_id)
 
             status_payload = adapter.publish_status(
-                status=status_text,
+                status=publish_text,
                 media_ids=media_ids or None,
                 visibility=visibility,
                 idempotency_key=idempotency_key,
@@ -265,11 +279,12 @@ def _publish_run_directory_bluesky(run_dir: Path, adapter: BlueskyAdapter) -> di
             if system_log_path is None:
                 raise RuntimeError("System log post selected but no system_log file found.")
             status_text = _read_text_file(system_log_path)
-            if len(status_text) > max_chars:
+            publish_text = append_ai_disclosure(status_text)
+            if len(publish_text) > max_chars:
                 raise RuntimeError(
-                    f"Status text length {len(status_text)} exceeds Bluesky limit {max_chars}."
+                    f"Status text length {len(publish_text)} exceeds Bluesky limit {max_chars}."
                 )
-            status_payload = adapter.publish_post(text=status_text)
+            status_payload = adapter.publish_post(text=publish_text)
             upsert_post_artifacts(
                 job_id=job_id,
                 system_log_path=str(system_log_path),
@@ -287,14 +302,15 @@ def _publish_run_directory_bluesky(run_dir: Path, adapter: BlueskyAdapter) -> di
             prompt_text = _read_text_file(prompt_path) if prompt_path else ""
             generated_title = _extract_title_from_prompt(prompt_text)
             status_text = _strip_title_from_caption(caption_text, generated_title)
-            if len(status_text) > max_chars:
+            publish_text = append_ai_disclosure(status_text)
+            if len(publish_text) > max_chars:
                 raise RuntimeError(
-                    f"Status text length {len(status_text)} exceeds Bluesky limit {max_chars}."
+                    f"Status text length {len(publish_text)} exceeds Bluesky limit {max_chars}."
                 )
 
             status_payload = adapter.publish_post(
-                text=status_text,
-                image_path=image_path if image_path is not None else None,
+                text=publish_text,
+                image_path=_social_upload_image_or_original(image_path) if image_path is not None else None,
                 image_alt="Copierbot surreal collage artwork",
             )
             upsert_post_artifacts(

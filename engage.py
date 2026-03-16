@@ -15,6 +15,7 @@ from mention_archive import save_mention_response_log
 from persona import get_persona_context
 from social.bluesky_adapter import BlueskyAPIError, BlueskyAdapter, load_bluesky_config
 from social.mastodon_adapter import MastodonAPIError, MastodonAdapter, load_mastodon_config
+from social_posting import append_ai_disclosure, disclosure_overhead_chars
 from storage import (
     create_reply_record,
     init_storage,
@@ -236,10 +237,19 @@ def _build_reply_text(
         f"{persona_context.strip()} "
         "Reply mode: diagnostics only, no quoted user text, no @handles."
     )
-    reply = generate_system_log_local(
-        persona_context=contextual_persona,
-        max_chars=max_chars,
-    )
+    # Mention replies use compact local diagnostics to avoid hard truncation.
+    reply = ""
+    for _ in range(6):
+        candidate = generate_system_log_local(
+            persona_context=contextual_persona,
+            max_chars=max_chars,
+            compact=True,
+        )
+        if "..." not in candidate:
+            reply = candidate
+            break
+        if not reply:
+            reply = candidate
 
     if len(reply) > max_chars:
         raise RuntimeError(
@@ -397,10 +407,16 @@ def process_unhandled_mastodon_mentions(
 
         reply_row_id: int | None = None
         try:
-            reply_text = _build_reply_text(
+            reply_budget = max(1, max_chars - disclosure_overhead_chars())
+            raw_reply_text = _build_reply_text(
                 persona_context=persona_context,
-                max_chars=max_chars,
+                max_chars=reply_budget,
             )
+            reply_text = append_ai_disclosure(raw_reply_text)
+            if len(reply_text) > max_chars:
+                raise RuntimeError(
+                    f"Reply text length {len(reply_text)} exceeds Mastodon limit {max_chars}."
+                )
             reply_row_id = create_reply_record(
                 mention_row_id=mention_row_id,
                 decision=decision,
@@ -497,10 +513,16 @@ def process_unhandled_bluesky_mentions(
 
         reply_row_id: int | None = None
         try:
-            reply_text = _build_reply_text(
+            reply_budget = max(1, max_chars - disclosure_overhead_chars())
+            raw_reply_text = _build_reply_text(
                 persona_context=persona_context,
-                max_chars=max_chars,
+                max_chars=reply_budget,
             )
+            reply_text = append_ai_disclosure(raw_reply_text)
+            if len(reply_text) > max_chars:
+                raise RuntimeError(
+                    f"Reply text length {len(reply_text)} exceeds Bluesky limit {max_chars}."
+                )
             reply_row_id = create_reply_record(
                 mention_row_id=mention_row_id,
                 decision=decision,
