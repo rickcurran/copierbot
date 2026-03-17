@@ -188,6 +188,7 @@ Available actions:
 - Run `engage.py` (check mentions/reply)
 - Publish a selected timestamped run folder
 - Set active publish destinations (`Mastodon`, `Bluesky`, or both)
+- Set active mention sources separately (`Mastodon`, `Bluesky`, or both)
 - Start/stop recurring `Generate + Publish` scheduler with hourly interval (`1-24`)
 - Start/stop recurring `Mentions` scheduler with minute interval (`1, 5, 10, 15, 20, 30, 60`)
 

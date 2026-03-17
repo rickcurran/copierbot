@@ -37,6 +37,7 @@ GENERATE_INTERVAL_HOURS = list(range(1, 25))
 MENTION_INTERVAL_MINUTES = [1, 5, 10, 15, 20, 30, 60]
 PUBLISH_PLATFORM_OPTIONS = ("mastodon", "bluesky")
 DEFAULT_ACTIVE_PUBLISH_PLATFORMS = ["mastodon"]
+DEFAULT_ACTIVE_MENTION_PLATFORMS = ["mastodon", "bluesky"]
 
 
 @dataclass
@@ -86,6 +87,7 @@ SCHEDULERS: dict[str, SchedulerState] = {
     ),
 }
 ACTIVE_PUBLISH_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS)
+ACTIVE_MENTION_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_MENTION_PLATFORMS)
 
 
 def _validate_generate_interval_seconds(value: int) -> int:
@@ -119,6 +121,21 @@ def _normalize_active_publish_platforms(raw_value: object) -> list[str]:
     return deduped or list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS)
 
 
+def _normalize_active_mention_platforms(raw_value: object) -> list[str]:
+    """Normalize persisted mention platform preference value."""
+    values: list[str] = []
+    if isinstance(raw_value, str):
+        values = [part.strip().lower() for part in raw_value.split(",")]
+    elif isinstance(raw_value, list):
+        values = [str(part).strip().lower() for part in raw_value]
+
+    deduped: list[str] = []
+    for value in values:
+        if value in PUBLISH_PLATFORM_OPTIONS and value not in deduped:
+            deduped.append(value)
+    return deduped or list(DEFAULT_ACTIVE_MENTION_PLATFORMS)
+
+
 def _active_platform_arg(platforms: list[str]) -> str:
     """Convert active platforms list to orchestrator --platform argument."""
     normalized = _normalize_active_publish_platforms(platforms)
@@ -142,12 +159,28 @@ def _set_active_publish_platforms(platforms: list[str]) -> None:
         _save_scheduler_preferences()
 
 
+def _get_active_mention_platforms() -> list[str]:
+    """Return current active mention platforms (copy)."""
+    with SCHED_LOCK:
+        return list(ACTIVE_MENTION_PLATFORMS)
+
+
+def _set_active_mention_platforms(platforms: list[str]) -> None:
+    """Update active mention platforms and persist preferences."""
+    normalized = _normalize_active_mention_platforms(platforms)
+    with SCHED_LOCK:
+        ACTIVE_MENTION_PLATFORMS.clear()
+        ACTIVE_MENTION_PLATFORMS.extend(normalized)
+        _save_scheduler_preferences()
+
+
 def _load_scheduler_preferences() -> dict[str, object]:
     """Load persisted scheduler interval preferences."""
     defaults = {
         "generate_publish_interval_seconds": 3600,
         "mentions_interval_seconds": 300,
         "active_publish_platforms": list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS),
+        "active_mention_platforms": list(DEFAULT_ACTIVE_MENTION_PLATFORMS),
     }
     try:
         raw = json.loads(SCHED_PREFS_PATH.read_text(encoding="utf-8"))
@@ -181,6 +214,13 @@ def _load_scheduler_preferences() -> dict[str, object]:
         "active_publish_platforms": _normalize_active_publish_platforms(
             raw.get("active_publish_platforms", defaults["active_publish_platforms"])
         ),
+        # Backward-compatible migration: old prefs used publish platforms for mentions.
+        "active_mention_platforms": _normalize_active_mention_platforms(
+            raw.get(
+                "active_mention_platforms",
+                raw.get("active_publish_platforms", defaults["active_mention_platforms"]),
+            )
+        ),
     }
 
 
@@ -190,6 +230,7 @@ def _save_scheduler_preferences() -> None:
         "generate_publish_interval_seconds": int(SCHEDULERS["generate_publish"].interval_seconds),
         "mentions_interval_seconds": int(SCHEDULERS["mentions"].interval_seconds),
         "active_publish_platforms": list(ACTIVE_PUBLISH_PLATFORMS),
+        "active_mention_platforms": list(ACTIVE_MENTION_PLATFORMS),
     }
     SCHED_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SCHED_PREFS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -203,6 +244,10 @@ def _apply_scheduler_preferences() -> None:
     ACTIVE_PUBLISH_PLATFORMS.clear()
     ACTIVE_PUBLISH_PLATFORMS.extend(
         _normalize_active_publish_platforms(prefs.get("active_publish_platforms"))
+    )
+    ACTIVE_MENTION_PLATFORMS.clear()
+    ACTIVE_MENTION_PLATFORMS.extend(
+        _normalize_active_mention_platforms(prefs.get("active_mention_platforms"))
     )
 
 
@@ -420,7 +465,7 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
         ]
 
     def _cmd_mentions(_: dict[str, str]) -> list[str]:
-        platform_arg = _active_platform_arg(_get_active_publish_platforms())
+        platform_arg = _active_platform_arg(_get_active_mention_platforms())
         return [sys.executable, "engage.py", "--platform", platform_arg]
 
     def _cmd_mentions_mastodon(_: dict[str, str]) -> list[str]:
@@ -499,7 +544,7 @@ def _run_generate_publish_cycle() -> str:
 
 def _run_mention_cycle() -> str:
     """Run one scheduled mention-monitor cycle."""
-    platform_arg = _active_platform_arg(_get_active_publish_platforms())
+    platform_arg = _active_platform_arg(_get_active_mention_platforms())
     job = _enqueue_job(
         label="Scheduled Mention Check",
         command=[sys.executable, "engage.py", "--platform", platform_arg],
@@ -702,6 +747,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/")
             self.end_headers()
             return
+        if action == "update_mention_platforms":
+            selected = form.get("mention_platform", [])
+            _set_active_mention_platforms([str(item) for item in selected])
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
 
         actions = _build_actions()
         action_info = actions.get(action)
@@ -788,9 +840,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         gp = sched["generate_publish"]
         mn = sched["mentions"]
-        active_platforms = _get_active_publish_platforms()
-        active_platform_arg = _active_platform_arg(active_platforms)
-        active_platforms_label = ", ".join(active_platforms)
+        active_publish_platforms = _get_active_publish_platforms()
+        active_publish_platform_arg = _active_platform_arg(active_publish_platforms)
+        active_publish_platforms_label = ", ".join(active_publish_platforms)
+        active_mention_platforms = _get_active_mention_platforms()
+        active_mention_platform_arg = _active_platform_arg(active_mention_platforms)
+        active_mention_platforms_label = ", ".join(active_mention_platforms)
         gp_hours_selected = max(1, int(gp["interval_seconds"]) // 3600)
         mn_mins_selected = max(1, int(mn["interval_seconds"]) // 60)
 
@@ -808,11 +863,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             for m in MENTION_INTERVAL_MINUTES
         )
-        platform_options = "".join(
+        publish_platform_options = "".join(
             (
                 "<label style='display:flex;align-items:center;gap:0.5rem;margin:0.35rem 0;'>"
                 f"<input type='checkbox' name='publish_platform' value='{name}'"
-                f"{' checked' if name in active_platforms else ''} />"
+                f"{' checked' if name in active_publish_platforms else ''} />"
+                f"<span>{name.title()}</span>"
+                "</label>"
+            )
+            for name in PUBLISH_PLATFORM_OPTIONS
+        )
+        mention_platform_options = "".join(
+            (
+                "<label style='display:flex;align-items:center;gap:0.5rem;margin:0.35rem 0;'>"
+                f"<input type='checkbox' name='mention_platform' value='{name}'"
+                f"{' checked' if name in active_mention_platforms else ''} />"
                 f"<span>{name.title()}</span>"
                 "</label>"
             )
@@ -985,11 +1050,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
       <div class="card">
         <h2>Publish Destinations</h2>
         <p class="hint">Choose active social platforms. Generate + Publish scheduler and manual publish actions will post to these destinations using one generated run.</p>
-        <p class="sched-meta">Active: {html.escape(active_platforms_label)} (orchestrator <code>--platform {html.escape(active_platform_arg)}</code>)</p>
+        <p class="sched-meta">Active: {html.escape(active_publish_platforms_label)} (orchestrator <code>--platform {html.escape(active_publish_platform_arg)}</code>)</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="update_publish_platforms" />
-          {platform_options}
+          {publish_platform_options}
           <button type="submit">Save Active Platforms</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Mention Sources</h2>
+        <p class="hint">Choose which platforms are checked by <code>engage.py</code> for manual "Check Mentions (All Platforms)" and the Mentions scheduler.</p>
+        <p class="sched-meta">Active: {html.escape(active_mention_platforms_label)} (engage <code>--platform {html.escape(active_mention_platform_arg)}</code>)</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="update_mention_platforms" />
+          {mention_platform_options}
+          <button type="submit">Save Mention Platforms</button>
         </form>
       </div>
 
@@ -997,7 +1073,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <h2>Scheduler: Generate + Publish</h2>
         <p class="hint">Runs <code>main.py</code>, then publishes all new run folders from that cycle in creation order (normal post first, phase-change post second when present) to active destinations.</p>
         <div class="sched-status {'running' if bool(gp['running']) else 'stopped'}">{'running' if bool(gp['running']) else 'stopped'}</div>
-        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_publish_platforms_label)}</p>
         <p class="sched-meta">Last run: {html.escape(str(gp['last_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Next run: {html.escape(str(gp['next_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Last result: {html.escape(str(gp['last_result']) or 'N/A')}</p>
@@ -1016,6 +1092,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <h2>Scheduler: Mentions</h2>
         <p class="hint">Runs <code>engage.py</code> on the selected minute interval to monitor and reply to qualifying mentions.</p>
         <div class="sched-status {'running' if bool(mn['running']) else 'stopped'}">{'running' if bool(mn['running']) else 'stopped'}</div>
+        <p class="sched-meta">Active platforms: {html.escape(active_mention_platforms_label)}</p>
         <p class="sched-meta">Last run: {html.escape(str(mn['last_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Next run: {html.escape(str(mn['next_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Last result: {html.escape(str(mn['last_result']) or 'N/A')}</p>
@@ -1044,7 +1121,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
       <div class="card">
         <h2>Publish Latest</h2>
         <p class="hint">Runs <code>orchestrator.py</code> to publish the newest generated run to active destinations.</p>
-        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_publish_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="publish_latest" />
           <button type="submit">Run orchestrator.py</button>
@@ -1053,8 +1130,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
       <div class="card">
         <h2>Check Mentions</h2>
-        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins. "All Platforms" follows active publish destinations.</p>
-        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
+        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins. "All Platforms" follows active mention sources.</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_mention_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="check_mentions" />
           <button type="submit">Check Mentions (All Platforms)</button>
@@ -1072,7 +1149,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
       <div class="card">
         <h2>Publish Specific Run</h2>
         <p class="hint">Select a run folder, then publish only that specific output instead of the latest one, to active destinations.</p>
-        <p class="sched-meta">Active platforms: {html.escape(active_platforms_label)}</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_publish_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="publish_selected" />
           <select name="run_dir">{run_options}</select>
