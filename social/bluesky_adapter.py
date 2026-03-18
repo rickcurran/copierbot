@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from PIL import Image
@@ -62,6 +63,8 @@ class BlueskyAdapter:
     """Thin wrapper around key Bluesky XRPC endpoints."""
 
     MAX_IMAGE_BYTES = 950 * 1024
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    MAX_REQUEST_RETRIES = 2
 
     def __init__(self, config: BlueskyConfig) -> None:
         self.config = config
@@ -86,45 +89,70 @@ class BlueskyAdapter:
         data: Any = None,
         extra_headers: dict[str, str] | None = None,
         auth: bool = True,
+        timeout_seconds: int | None = None,
     ) -> Any:
         """Perform a Bluesky XRPC request and return JSON payload."""
         url = f"{self.config.pds_url}{path}"
         headers = dict(extra_headers or {})
         if auth and self._access_jwt:
             headers["Authorization"] = f"Bearer {self._access_jwt}"
+        request_timeout = int(timeout_seconds or self.config.timeout_seconds)
+        max_attempts = 1 + self.MAX_REQUEST_RETRIES
+        last_error: Exception | None = None
 
-        try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_body,
-                data=data,
-                headers=headers or None,
-                timeout=self.config.timeout_seconds,
-            )
-        except requests.RequestException as exc:
-            raise BlueskyAPIError(f"Bluesky request failed ({method} {path}): {exc}") from exc
-
-        if response.status_code >= 400:
-            message = response.text[:320]
+        for attempt in range(max_attempts):
             try:
-                payload = response.json()
-                message = str(payload.get("message") or payload.get("error") or message)
-            except ValueError:
-                pass
-            raise BlueskyAPIError(
-                f"Bluesky API error {response.status_code} ({method} {path}): {message}"
-            )
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_body,
+                    data=data,
+                    headers=headers or None,
+                    timeout=request_timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(0.7 * (2**attempt))
+                    continue
+                raise BlueskyAPIError(f"Bluesky request failed ({method} {path}): {exc}") from exc
 
-        if not response.content:
-            return {}
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise BlueskyAPIError(
-                f"Bluesky API returned non-JSON response ({method} {path})."
-            ) from exc
+            if (
+                response.status_code in self.RETRYABLE_STATUS_CODES
+                and attempt < max_attempts - 1
+            ):
+                retry_after = response.headers.get("Retry-After", "").strip()
+                try:
+                    wait_seconds = float(retry_after)
+                except ValueError:
+                    wait_seconds = 0.7 * (2**attempt)
+                time.sleep(max(0.2, min(wait_seconds, 8.0)))
+                continue
+
+            if response.status_code >= 400:
+                message = response.text[:320]
+                try:
+                    payload = response.json()
+                    message = str(payload.get("message") or payload.get("error") or message)
+                except ValueError:
+                    pass
+                raise BlueskyAPIError(
+                    f"Bluesky API error {response.status_code} ({method} {path}): {message}"
+                )
+
+            if not response.content:
+                return {}
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise BlueskyAPIError(
+                    f"Bluesky API returned non-JSON response ({method} {path})."
+                ) from exc
+
+        if last_error is not None:
+            raise BlueskyAPIError(f"Bluesky request failed ({method} {path}): {last_error}")
+        raise BlueskyAPIError(f"Bluesky request failed ({method} {path}): unknown error")
 
     def _ensure_session(self) -> None:
         """Create a session if needed and cache auth context."""
@@ -235,6 +263,7 @@ class BlueskyAdapter:
             "/xrpc/com.atproto.repo.uploadBlob",
             data=payload_bytes,
             extra_headers={"Content-Type": mime_type},
+            timeout_seconds=max(self.config.timeout_seconds, 60),
         )
         if not isinstance(payload, dict):
             raise BlueskyAPIError("Unexpected uploadBlob payload type.")
