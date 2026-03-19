@@ -35,9 +35,15 @@ URL_RE = re.compile(r"https?://[^\s<>'\"]+")
 
 GENERATE_INTERVAL_HOURS = list(range(1, 25))
 MENTION_INTERVAL_MINUTES = [1, 5, 10, 15, 20, 30, 60]
-PUBLISH_PLATFORM_OPTIONS = ("mastodon", "bluesky")
+PUBLISH_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress")
+MENTION_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress")
 DEFAULT_ACTIVE_PUBLISH_PLATFORMS = ["mastodon"]
 DEFAULT_ACTIVE_MENTION_PLATFORMS = ["mastodon", "bluesky"]
+PLATFORM_DISPLAY_NAMES = {
+    "mastodon": "Mastodon",
+    "bluesky": "Bluesky",
+    "wordpress": "WordPress",
+}
 
 
 @dataclass
@@ -131,16 +137,39 @@ def _normalize_active_mention_platforms(raw_value: object) -> list[str]:
 
     deduped: list[str] = []
     for value in values:
-        if value in PUBLISH_PLATFORM_OPTIONS and value not in deduped:
+        if value in MENTION_PLATFORM_OPTIONS and value not in deduped:
             deduped.append(value)
     return deduped or list(DEFAULT_ACTIVE_MENTION_PLATFORMS)
 
 
-def _active_platform_arg(platforms: list[str]) -> str:
-    """Convert active platforms list to orchestrator --platform argument."""
+def _platform_display_name(name: str) -> str:
+    """Return user-facing platform label with canonical capitalization."""
+    key = (name or "").strip().lower()
+    return PLATFORM_DISPLAY_NAMES.get(key, key.title())
+
+
+def _platforms_display_label(platforms: list[str]) -> str:
+    """Return comma-separated user-facing platform labels."""
+    return ", ".join(_platform_display_name(name) for name in platforms)
+
+
+def _active_publish_platform_arg(platforms: list[str]) -> str:
+    """Convert active publish platforms list to orchestrator --platform argument."""
     normalized = _normalize_active_publish_platforms(platforms)
-    if len(normalized) == 2:
+    if len(normalized) == len(PUBLISH_PLATFORM_OPTIONS):
         return "all"
+    if len(normalized) == 1:
+        return normalized[0]
+    return ",".join(normalized)
+
+
+def _active_mention_platform_arg(platforms: list[str]) -> str:
+    """Convert active mention platforms list to engage --platform argument."""
+    normalized = _normalize_active_mention_platforms(platforms)
+    if len(normalized) == len(MENTION_PLATFORM_OPTIONS):
+        return "all"
+    if len(normalized) == 1:
+        return normalized[0]
     return normalized[0]
 
 
@@ -445,7 +474,7 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
         return [sys.executable, "main.py"]
 
     def _cmd_publish_latest(_: dict[str, str]) -> list[str]:
-        platform_arg = _active_platform_arg(_get_active_publish_platforms())
+        platform_arg = _active_publish_platform_arg(_get_active_publish_platforms())
         return [sys.executable, "orchestrator.py", "--platform", platform_arg]
 
     def _cmd_publish_selected(payload: dict[str, str]) -> list[str] | None:
@@ -454,7 +483,7 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
             return None
         if not RUN_DIR_RE.match(run_dir):
             return None
-        platform_arg = _active_platform_arg(_get_active_publish_platforms())
+        platform_arg = _active_publish_platform_arg(_get_active_publish_platforms())
         return [
             sys.executable,
             "orchestrator.py",
@@ -465,7 +494,7 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
         ]
 
     def _cmd_mentions(_: dict[str, str]) -> list[str]:
-        platform_arg = _active_platform_arg(_get_active_mention_platforms())
+        platform_arg = _active_mention_platform_arg(_get_active_mention_platforms())
         return [sys.executable, "engage.py", "--platform", platform_arg]
 
     def _cmd_mentions_mastodon(_: dict[str, str]) -> list[str]:
@@ -474,6 +503,9 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
     def _cmd_mentions_bluesky(_: dict[str, str]) -> list[str]:
         return [sys.executable, "engage.py", "--platform", "bluesky"]
 
+    def _cmd_mentions_wordpress(_: dict[str, str]) -> list[str]:
+        return [sys.executable, "engage.py", "--platform", "wordpress"]
+
     return {
         "generate": ("Generate Post", _cmd_generate),
         "publish_latest": ("Publish Latest Run", _cmd_publish_latest),
@@ -481,6 +513,7 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
         "check_mentions": ("Check Mentions (All)", _cmd_mentions),
         "check_mentions_mastodon": ("Check Mentions (Mastodon)", _cmd_mentions_mastodon),
         "check_mentions_bluesky": ("Check Mentions (Bluesky)", _cmd_mentions_bluesky),
+        "check_mentions_wordpress": ("Check Mentions (WordPress)", _cmd_mentions_wordpress),
     }
 
 
@@ -510,7 +543,7 @@ def _run_generate_publish_cycle() -> str:
             return "main.py succeeded; no run-manifest entries found."
 
         active_platforms = _get_active_publish_platforms()
-        platform_arg = _active_platform_arg(active_platforms)
+        platform_arg = _active_publish_platform_arg(active_platforms)
         published = 0
         publish_failed = 0
         for run_path in created:
@@ -544,7 +577,7 @@ def _run_generate_publish_cycle() -> str:
 
 def _run_mention_cycle() -> str:
     """Run one scheduled mention-monitor cycle."""
-    platform_arg = _active_platform_arg(_get_active_mention_platforms())
+    platform_arg = _active_mention_platform_arg(_get_active_mention_platforms())
     job = _enqueue_job(
         label="Scheduled Mention Check",
         command=[sys.executable, "engage.py", "--platform", platform_arg],
@@ -780,7 +813,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 queued_message = (
                     "waiting "
                     f"{_format_wait_duration(initial_delay_seconds)}; "
-                    f"recent publish detected for {_active_platform_arg(active_platforms)}."
+                    f"recent publish detected for {_active_publish_platform_arg(active_platforms)}."
                 )
             _start_scheduler(
                 key="generate_publish",
@@ -841,11 +874,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         gp = sched["generate_publish"]
         mn = sched["mentions"]
         active_publish_platforms = _get_active_publish_platforms()
-        active_publish_platform_arg = _active_platform_arg(active_publish_platforms)
-        active_publish_platforms_label = ", ".join(active_publish_platforms)
+        active_publish_platform_arg = _active_publish_platform_arg(active_publish_platforms)
+        active_publish_platforms_label = _platforms_display_label(active_publish_platforms)
         active_mention_platforms = _get_active_mention_platforms()
-        active_mention_platform_arg = _active_platform_arg(active_mention_platforms)
-        active_mention_platforms_label = ", ".join(active_mention_platforms)
+        active_mention_platform_arg = _active_mention_platform_arg(active_mention_platforms)
+        active_mention_platforms_label = _platforms_display_label(active_mention_platforms)
         gp_hours_selected = max(1, int(gp["interval_seconds"]) // 3600)
         mn_mins_selected = max(1, int(mn["interval_seconds"]) // 60)
 
@@ -868,7 +901,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "<label style='display:flex;align-items:center;gap:0.5rem;margin:0.35rem 0;'>"
                 f"<input type='checkbox' name='publish_platform' value='{name}'"
                 f"{' checked' if name in active_publish_platforms else ''} />"
-                f"<span>{name.title()}</span>"
+                f"<span>{_platform_display_name(name)}</span>"
                 "</label>"
             )
             for name in PUBLISH_PLATFORM_OPTIONS
@@ -878,10 +911,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "<label style='display:flex;align-items:center;gap:0.5rem;margin:0.35rem 0;'>"
                 f"<input type='checkbox' name='mention_platform' value='{name}'"
                 f"{' checked' if name in active_mention_platforms else ''} />"
-                f"<span>{name.title()}</span>"
+                f"<span>{_platform_display_name(name)}</span>"
                 "</label>"
             )
-            for name in PUBLISH_PLATFORM_OPTIONS
+            for name in MENTION_PLATFORM_OPTIONS
         )
 
         body = f"""<!doctype html>
@@ -1143,6 +1176,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <form method="post" action="/run" style="margin-top:0.5rem;">
           <input type="hidden" name="action" value="check_mentions_bluesky" />
           <button type="submit">Check Mentions (Bluesky)</button>
+        </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="check_mentions_wordpress" />
+          <button type="submit">Check Mentions (WordPress)</button>
         </form>
       </div>
 

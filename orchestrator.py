@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ from social.bluesky_adapter import BlueskyAdapter, BlueskyAPIError, load_bluesky
 from social_image import build_social_composite_image
 from social.mastodon_adapter import MastodonAdapter, MastodonAPIError, load_mastodon_config
 from social_posting import append_ai_disclosure
+from social.wordpress_adapter import WordpressAdapter, WordpressAPIError, load_wordpress_config
 from storage import (
     create_post_job,
     find_post_job_by_idempotency_key,
@@ -23,6 +25,8 @@ from storage import (
 
 OUTPUT_DIR = Path("output")
 RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?$")
+RUN_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})(?:-\d+)?$")
+PUBLISH_PLATFORM_ORDER = ("mastodon", "bluesky", "wordpress")
 
 
 def _setup_logging() -> None:
@@ -112,11 +116,74 @@ def _strip_title_from_caption(caption_text: str, title: str) -> str:
     return normalized
 
 
+def _first_nonempty_line(text: str) -> str:
+    """Return first non-empty line from text."""
+    for line in (text or "").splitlines():
+        value = line.strip()
+        if value:
+            return value
+    return ""
+
+
+def _safe_title_for_wordpress(title: str) -> str:
+    """Normalize title for WordPress posts."""
+    value = " ".join((title or "").replace("\r", " ").replace("\n", " ").split())
+    value = value.replace("[", "(").replace("]", ")")
+    return value[:180].strip() or "Copierbot Post"
+
+
+def _wordpress_date_fields_from_run_dir(run_dir: Path) -> tuple[str, str] | None:
+    """Build WordPress date/date_gmt fields from timestamped run folder name."""
+    match = RUN_TS_RE.match(run_dir.name)
+    if not match:
+        return None
+    timestamp = match.group(1)
+    try:
+        naive_local = datetime.strptime(timestamp, "%Y-%m-%d-%H-%M-%S")
+    except ValueError:
+        return None
+    local_tz = datetime.now().astimezone().tzinfo
+    if local_tz is None:
+        return None
+    local_dt = naive_local.replace(tzinfo=local_tz)
+    gmt_dt = local_dt.astimezone(timezone.utc)
+    return (
+        local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        gmt_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+
+
 def _detect_post_type(run_dir: Path) -> str:
     """Infer post type from available artifacts in run folder."""
     if _pick_single_file(run_dir, "system_log  *.txt"):
         return "system_log"
     return "news"
+
+
+def _parse_platform_targets(raw: str) -> list[str]:
+    """Parse platform argument into ordered unique publish targets."""
+    value = (raw or "mastodon").strip().lower()
+    if not value:
+        value = "mastodon"
+    if value == "all":
+        return list(PUBLISH_PLATFORM_ORDER)
+
+    parts = [part.strip().lower() for part in value.split(",") if part.strip()]
+    if not parts:
+        parts = ["mastodon"]
+
+    invalid = [part for part in parts if part not in PUBLISH_PLATFORM_ORDER]
+    if invalid:
+        allowed = ", ".join(PUBLISH_PLATFORM_ORDER) + ", all"
+        raise ValueError(
+            f"Unsupported platform value(s): {', '.join(invalid)}. Allowed: {allowed}"
+        )
+
+    deduped: list[str] = []
+    for part in parts:
+        if part not in deduped:
+            deduped.append(part)
+    return deduped
 
 
 def _publish_run_directory_mastodon(
@@ -347,12 +414,125 @@ def _publish_run_directory_bluesky(run_dir: Path, adapter: BlueskyAdapter) -> di
         raise
 
 
+def _publish_run_directory_wordpress(run_dir: Path, adapter: WordpressAdapter) -> dict:
+    """Publish one run directory to WordPress REST API."""
+    init_storage()
+    run_dir = run_dir.resolve()
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run directory does not exist: {run_dir}")
+
+    post_type = _detect_post_type(run_dir)
+    idempotency_key = f"publish:wordpress:{run_dir.name}"
+    existing_job = find_post_job_by_idempotency_key(idempotency_key)
+    if existing_job and existing_job.get("status") == "published":
+        return {
+            "job_id": int(existing_job["id"]),
+            "status": "already_published",
+            "post_type": post_type,
+            "run_dir": str(run_dir),
+            "platform": "wordpress",
+        }
+
+    if existing_job:
+        job_id = int(existing_job["id"])
+    else:
+        job_id = create_post_job(
+            post_type=post_type,
+            status="generated",
+            idempotency_key=idempotency_key,
+        )
+
+    update_post_job_status(job_id, status="publishing", error="")
+    date_fields = _wordpress_date_fields_from_run_dir(run_dir)
+    publish_date = date_fields[0] if date_fields else ""
+    publish_date_gmt = date_fields[1] if date_fields else ""
+
+    try:
+        if post_type == "system_log":
+            system_log_path = _pick_single_file(run_dir, "system_log  *.txt")
+            if system_log_path is None:
+                raise RuntimeError("System log post selected but no system_log file found.")
+            system_log_text = _read_text_file(system_log_path)
+            title = "SYSTEM LOG"
+            post_result = adapter.publish_post(
+                title=title,
+                body_text=system_log_text,
+                image_path=None,
+                publish_date=publish_date,
+                publish_date_gmt=publish_date_gmt,
+            )
+            upsert_post_artifacts(
+                job_id=job_id,
+                title=title,
+                caption=system_log_text,
+                system_log_path=str(system_log_path),
+            )
+        else:
+            caption_path = _pick_single_file(run_dir, "caption  *.txt")
+            image_path = _pick_image_file(run_dir)
+            prompt_path = _pick_single_file(run_dir, "prompt  *.txt")
+
+            if caption_path is None:
+                raise RuntimeError("News post selected but no caption file found.")
+
+            caption_text = _read_text_file(caption_path)
+            prompt_text = _read_text_file(prompt_path) if prompt_path else ""
+            generated_title = _extract_title_from_prompt(prompt_text)
+            title = _safe_title_for_wordpress(
+                generated_title or _first_nonempty_line(caption_text) or "Copierbot Dispatch"
+            )
+            caption_body = _strip_title_from_caption(caption_text, generated_title)
+            if not caption_body:
+                caption_body = caption_text.strip()
+
+            # WordPress receives the original non-composited image and caption below it.
+            post_result = adapter.publish_post(
+                title=title,
+                body_text=caption_body,
+                image_path=image_path,
+                publish_date=publish_date,
+                publish_date_gmt=publish_date_gmt,
+            )
+            upsert_post_artifacts(
+                job_id=job_id,
+                title=title,
+                caption=caption_text,
+                prompt=prompt_text,
+                image_path=str(image_path) if image_path else "",
+            )
+
+        remote_post_id = str(post_result.get("id", "")).strip()
+        remote_url = str(post_result.get("url", "")).strip()
+        if not remote_post_id:
+            raise RuntimeError("WordPress publish succeeded but returned no post id.")
+        record_published_post(
+            job_id=job_id,
+            platform="wordpress",
+            remote_post_id=remote_post_id,
+            remote_url=remote_url,
+        )
+        update_post_job_status(job_id, status="published", error="")
+        return {
+            "job_id": job_id,
+            "status": "published",
+            "post_type": post_type,
+            "run_dir": str(run_dir),
+            "remote_post_id": remote_post_id,
+            "remote_url": remote_url,
+            "platform": "wordpress",
+        }
+    except (RuntimeError, WordpressAPIError, FileNotFoundError) as exc:
+        update_post_job_status(job_id, status="failed", error=str(exc))
+        raise
+
+
 def publish_run_directory(
     run_dir: Path,
     *,
     platform: str,
     mastodon_adapter: MastodonAdapter | None = None,
     bluesky_adapter: BlueskyAdapter | None = None,
+    wordpress_adapter: WordpressAdapter | None = None,
     visibility: str = "",
 ) -> dict:
     """Publish one run directory to selected platform."""
@@ -369,7 +549,11 @@ def publish_run_directory(
         if bluesky_adapter is None:
             raise ValueError("bluesky_adapter is required for platform='bluesky'.")
         return _publish_run_directory_bluesky(run_dir=run_dir, adapter=bluesky_adapter)
-    raise ValueError("Unsupported platform. Use 'mastodon' or 'bluesky'.")
+    if selected == "wordpress":
+        if wordpress_adapter is None:
+            raise ValueError("wordpress_adapter is required for platform='wordpress'.")
+        return _publish_run_directory_wordpress(run_dir=run_dir, adapter=wordpress_adapter)
+    raise ValueError("Unsupported platform.")
 
 
 def main() -> int:
@@ -384,8 +568,10 @@ def main() -> int:
     parser.add_argument(
         "--platform",
         default="mastodon",
-        choices=["mastodon", "bluesky", "all"],
-        help="Publishing destination platform.",
+        help=(
+            "Publishing destination platform(s): mastodon, bluesky, wordpress, all, "
+            "or comma-separated subset (e.g. bluesky,wordpress)."
+        ),
     )
     parser.add_argument(
         "--visibility",
@@ -395,16 +581,11 @@ def main() -> int:
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve() if args.run_dir else _latest_run_dir()
-    platform = args.platform.strip().lower()
-
-    targets: list[str]
-    if platform == "all":
-        targets = ["mastodon", "bluesky"]
-    else:
-        targets = [platform]
+    targets = _parse_platform_targets(args.platform)
 
     mastodon_adapter: MastodonAdapter | None = None
     bluesky_adapter: BlueskyAdapter | None = None
+    wordpress_adapter: WordpressAdapter | None = None
 
     if "mastodon" in targets:
         mastodon_config = load_mastodon_config(required=True)
@@ -420,12 +601,24 @@ def main() -> int:
         bluesky_account = bluesky_adapter.verify_account()
         logging.info("Bluesky account verified: @%s", bluesky_account.get("handle", "unknown"))
 
+    if "wordpress" in targets:
+        wordpress_config = load_wordpress_config(required=True)
+        assert wordpress_config is not None
+        wordpress_adapter = WordpressAdapter(wordpress_config)
+        wordpress_target = wordpress_adapter.verify_account()
+        logging.info(
+            "WordPress account verified: user=%s site=%s",
+            wordpress_target.get("slug", "unknown"),
+            wordpress_config.base_url,
+        )
+
     for target in targets:
         result = publish_run_directory(
             run_dir=run_dir,
             platform=target,
             mastodon_adapter=mastodon_adapter,
             bluesky_adapter=bluesky_adapter,
+            wordpress_adapter=wordpress_adapter,
             visibility=args.visibility,
         )
         logging.info(

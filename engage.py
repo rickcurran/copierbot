@@ -1,4 +1,4 @@
-"""Monitor Mastodon mentions and post in-character system-log replies."""
+"""Monitor social mentions/comments and post in-character system-log replies."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from mention_archive import save_mention_response_log
 from persona import get_persona_context
 from social.bluesky_adapter import BlueskyAPIError, BlueskyAdapter, load_bluesky_config
 from social.mastodon_adapter import MastodonAPIError, MastodonAdapter, load_mastodon_config
+from social.wordpress_adapter import WordpressAPIError, WordpressAdapter, load_wordpress_config
 from social_posting import append_ai_disclosure, disclosure_overhead_chars
 from storage import (
     create_reply_record,
@@ -29,6 +30,7 @@ from system_log import generate_system_log_local
 
 MASTODON_MENTION_CURSOR_PATH = Path("data/mention_cursor.json")
 BLUESKY_MENTION_CURSOR_PATH = Path("data/bluesky_mention_cursor.json")
+WORDPRESS_COMMENT_CURSOR_PATH = Path("data/wordpress_comment_cursor.json")
 
 CHECKIN_PATTERNS = [
     re.compile(r"\bhow\s+(are|r)\s+you\b", re.IGNORECASE),
@@ -139,6 +141,29 @@ def _save_bluesky_mention_cursor(notification_uri: str) -> None:
     BLUESKY_MENTION_CURSOR_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _load_wordpress_comment_cursor() -> int:
+    """Load highest seen WordPress comment id cursor."""
+    try:
+        raw = json.loads(WORDPRESS_COMMENT_CURSOR_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(raw, dict):
+        return 0
+    try:
+        return max(0, int(raw.get("last_comment_id", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _save_wordpress_comment_cursor(comment_id: int) -> None:
+    """Persist highest seen WordPress comment id cursor."""
+    WORDPRESS_COMMENT_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_comment_id": max(0, int(comment_id))}
+    WORDPRESS_COMMENT_CURSOR_PATH.write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def _extract_mention_payload(notification: dict[str, Any], self_account_id: str) -> dict[str, str] | None:
     """Extract mention fields from one Mastodon notification payload."""
     if str(notification.get("type", "")).lower() != "mention":
@@ -206,6 +231,39 @@ def _extract_bluesky_mention_payload(
         "author": author,
         "text": text,
         "source_created_at": str(notification.get("indexedAt", "")).strip(),
+    }
+
+
+def _extract_wordpress_comment_payload(
+    comment: dict[str, Any], self_user_id: int
+) -> dict[str, str] | None:
+    """Extract mention-like fields from one WordPress comment payload."""
+    comment_id = str(comment.get("id", "")).strip()
+    if not comment_id:
+        return None
+
+    try:
+        author_id = int(comment.get("author") or 0)
+    except (TypeError, ValueError):
+        author_id = 0
+    if self_user_id > 0 and author_id == self_user_id:
+        return None
+
+    author_name = str(comment.get("author_name") or "").strip()
+    author = author_name or f"commenter-{comment_id}"
+    content_payload = comment.get("content")
+    content_html = ""
+    if isinstance(content_payload, dict):
+        content_html = str(content_payload.get("rendered", "")).strip()
+    text = _to_plain_text(content_html)
+
+    return {
+        "mention_id": comment_id,
+        "author": author,
+        "text": text,
+        "source_created_at": str(
+            comment.get("date_gmt") or comment.get("date") or ""
+        ).strip(),
     }
 
 
@@ -368,6 +426,62 @@ def ingest_bluesky_mentions(adapter: BlueskyAdapter, self_did: str, fetch_limit:
 
     if newest_uri and newest_uri != last_seen_uri:
         _save_bluesky_mention_cursor(newest_uri)
+
+    return inserted
+
+
+def ingest_wordpress_comments(
+    adapter: WordpressAdapter, self_user_id: int, fetch_limit: int = 50
+) -> int:
+    """Fetch WordPress comments and upsert them as mention rows."""
+    last_seen_id = _load_wordpress_comment_cursor()
+    highest_seen_id = last_seen_id
+    inserted = 0
+    reached_seen = False
+    per_page = max(1, min(fetch_limit, 100))
+
+    for page in range(1, 11):
+        comments = adapter.list_comments(per_page=per_page, page=page, order="desc")
+        if not comments:
+            break
+
+        for comment in comments:
+            try:
+                comment_id_int = int(comment.get("id") or 0)
+            except (TypeError, ValueError):
+                comment_id_int = 0
+            if comment_id_int <= 0:
+                continue
+
+            if comment_id_int > highest_seen_id:
+                highest_seen_id = comment_id_int
+
+            if last_seen_id and comment_id_int <= last_seen_id:
+                reached_seen = True
+                break
+
+            mention = _extract_wordpress_comment_payload(
+                comment=comment,
+                self_user_id=self_user_id,
+            )
+            if mention is None:
+                continue
+            upsert_mention(
+                platform="wordpress",
+                mention_id=mention["mention_id"],
+                author=mention["author"],
+                text=mention["text"],
+                source_created_at=mention["source_created_at"],
+            )
+            inserted += 1
+
+        if reached_seen:
+            break
+        if len(comments) < per_page:
+            break
+
+    if highest_seen_id > last_seen_id:
+        _save_wordpress_comment_cursor(highest_seen_id)
 
     return inserted
 
@@ -583,14 +697,128 @@ def process_unhandled_bluesky_mentions(
     return stats
 
 
+def process_unhandled_wordpress_mentions(
+    *,
+    adapter: WordpressAdapter,
+    persona_context: str,
+    max_chars: int,
+    process_limit: int = 20,
+) -> dict[str, int]:
+    """Process queued WordPress comment mentions and publish system-log replies."""
+    stats = {
+        "seen_unhandled": 0,
+        "replied": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+    mentions = list_unhandled_mentions(platform="wordpress", limit=process_limit)
+    for mention in mentions:
+        stats["seen_unhandled"] += 1
+        mention_row_id = int(mention["id"])
+        mention_id = str(mention.get("mention_id", "")).strip()
+        mention_author = str(mention.get("author", "")).strip()
+        mention_text = str(mention.get("text", "")).strip()
+
+        classification, decision = _classify_mention_text(mention_text)
+        if decision != "reply_system_log":
+            mark_mention_handled(
+                mention_row_id=mention_row_id,
+                classification=classification,
+                decision=decision,
+            )
+            stats["skipped"] += 1
+            continue
+
+        reply_row_id: int | None = None
+        try:
+            reply_text = _build_reply_text(
+                persona_context=persona_context,
+                max_chars=max_chars,
+            )
+            reply_row_id = create_reply_record(
+                mention_row_id=mention_row_id,
+                decision=decision,
+                status="sending",
+                reply_text=reply_text,
+                platform="wordpress",
+            )
+
+            comment_payload = adapter.get_comment(int(mention_id))
+            try:
+                post_id = int(comment_payload.get("post") or 0)
+            except (TypeError, ValueError):
+                post_id = 0
+            if post_id <= 0:
+                raise RuntimeError(
+                    f"WordPress comment {mention_id} is missing a valid parent post id."
+                )
+
+            payload = adapter.reply_to_comment(
+                post_id=post_id,
+                parent_comment_id=int(mention_id),
+                text=reply_text,
+            )
+            remote_reply_id = str(payload.get("id", "")).strip()
+            remote_reply_url = str(payload.get("link", "")).strip()
+
+            update_reply_record(
+                reply_row_id=reply_row_id,
+                status="sent",
+                remote_reply_id=remote_reply_id,
+            )
+            mention_log_path = save_mention_response_log(
+                mention_id=mention_id,
+                author=mention_author,
+                original_text=mention_text,
+                reply_text=reply_text,
+                response_url=remote_reply_url,
+            )
+            logging.info("Saved WordPress mention response log to %s", mention_log_path)
+            mark_mention_handled(
+                mention_row_id=mention_row_id,
+                classification=classification,
+                decision="replied_system_log",
+            )
+            stats["replied"] += 1
+            logging.info(
+                "Replied to WordPress comment %s from %s%s",
+                mention_id,
+                mention_author or "unknown",
+                f" -> {remote_reply_url}" if remote_reply_url else "",
+            )
+        except Exception as exc:
+            if reply_row_id is None:
+                create_reply_record(
+                    mention_row_id=mention_row_id,
+                    decision=decision,
+                    status="failed",
+                    reply_text="",
+                    platform="wordpress",
+                    error=str(exc),
+                )
+            else:
+                update_reply_record(
+                    reply_row_id=reply_row_id,
+                    status="failed",
+                    error=str(exc),
+                )
+            stats["failed"] += 1
+            logging.error("Failed replying to WordPress comment %s: %s", mention_id, exc)
+
+    return stats
+
+
 def run() -> None:
     """CLI entrypoint for mention ingestion and reply handling."""
     _setup_logging()
-    parser = argparse.ArgumentParser(description="Process Mastodon/Bluesky mentions for Copierbot.")
+    parser = argparse.ArgumentParser(
+        description="Process Mastodon/Bluesky mentions and WordPress comments for Copierbot."
+    )
     parser.add_argument(
         "--platform",
         default="all",
-        choices=["mastodon", "bluesky", "all"],
+        choices=["mastodon", "bluesky", "wordpress", "all"],
         help="Mention source platform(s) to process.",
     )
     parser.add_argument(
@@ -610,7 +838,7 @@ def run() -> None:
     settings = get_settings(require_news_api_key=False, require_openai_api_key=False)
     init_storage()
     persona_context = get_persona_context()
-    targets = ["mastodon", "bluesky"] if args.platform == "all" else [args.platform]
+    targets = ["mastodon", "bluesky", "wordpress"] if args.platform == "all" else [args.platform]
 
     ran_any = False
     for platform in targets:
@@ -679,6 +907,41 @@ def run() -> None:
             ran_any = True
             continue
 
+        if platform == "wordpress":
+            wordpress_config = load_wordpress_config(required=False)
+            if wordpress_config is None:
+                logging.warning("Skipping WordPress mention processing: config not set.")
+                continue
+            adapter = WordpressAdapter(wordpress_config)
+            account = adapter.verify_account()
+            try:
+                self_user_id = int(account.get("id") or 0)
+            except (TypeError, ValueError):
+                self_user_id = 0
+            max_chars = max(280, settings.bluesky_max_chars)
+
+            ingested = ingest_wordpress_comments(
+                adapter=adapter,
+                self_user_id=self_user_id,
+                fetch_limit=max(1, min(args.fetch_limit, 100)),
+            )
+            stats = process_unhandled_wordpress_mentions(
+                adapter=adapter,
+                persona_context=persona_context,
+                max_chars=max_chars,
+                process_limit=max(1, args.process_limit),
+            )
+            logging.info(
+                "WordPress mention processing complete: ingested=%d, seen_unhandled=%d, replied=%d, skipped=%d, failed=%d",
+                ingested,
+                stats["seen_unhandled"],
+                stats["replied"],
+                stats["skipped"],
+                stats["failed"],
+            )
+            ran_any = True
+            continue
+
     if not ran_any:
         raise ValueError("No mention platforms could be processed. Check platform configs.")
 
@@ -686,7 +949,7 @@ def run() -> None:
 if __name__ == "__main__":
     try:
         run()
-    except (ValueError, RuntimeError, MastodonAPIError, BlueskyAPIError) as exc:
+    except (ValueError, RuntimeError, MastodonAPIError, BlueskyAPIError, WordpressAPIError) as exc:
         logging.basicConfig(level=logging.ERROR, format="%(levelname)s | %(message)s")
         logging.error("Mention processor failed: %s", exc)
         raise SystemExit(1)

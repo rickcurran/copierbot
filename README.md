@@ -153,6 +153,11 @@ BLUESKY_PDS_URL=https://bsky.social
 BLUESKY_HANDLE=your.handle.bsky.social
 BLUESKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 BLUESKY_MAX_CHARS=300
+WORDPRESS_BASE_URL=https://example.com
+WORDPRESS_USERNAME=your_wp_username
+WORDPRESS_APP_PASSWORD=xxxx xxxx xxxx xxxx xxxx xxxx
+WORDPRESS_POST_STATUS=publish
+WORDPRESS_TIMEOUT_SECONDS=30
 ```
 
 Post length modes:
@@ -187,8 +192,8 @@ Available actions:
 - Run `orchestrator.py` (publish latest run)
 - Run `engage.py` (check mentions/reply)
 - Publish a selected timestamped run folder
-- Set active publish destinations (`Mastodon`, `Bluesky`, or both)
-- Set active mention sources separately (`Mastodon`, `Bluesky`, or both)
+- Set active publish destinations (`Mastodon`, `Bluesky`, `WordPress`, or any combination)
+- Set active mention sources separately (`Mastodon`, `Bluesky`, `WordPress`, or any combination)
 - Start/stop recurring `Generate + Publish` scheduler with hourly interval (`1-24`)
 - Start/stop recurring `Mentions` scheduler with minute interval (`1, 5, 10, 15, 20, 30, 60`)
 
@@ -202,7 +207,7 @@ Notes:
 - Scheduled generate flow runs `main.py`, then publishes all newly created run folders from that cycle in creation order (normal post first, phase-change post second when present).
 - Selected scheduler intervals persist across dashboard stop/restart for both Generate+Publish and Mentions schedulers.
 - When starting Generate+Publish, if an active-platform post was already published within the selected interval window, the first run is delayed instead of firing immediately.
-- Recent Jobs output auto-links URLs (for example Mastodon/Bluesky links) in job logs.
+- Recent Jobs output auto-links URLs (for example Mastodon/Bluesky/WordPress links) in job logs.
 
 ## Publish To Social Platforms
 
@@ -230,24 +235,38 @@ Publish to Bluesky instead:
 python orchestrator.py --platform bluesky
 ```
 
-Publish to both Mastodon and Bluesky in one run:
+Publish to WordPress instead:
+
+```bash
+python orchestrator.py --platform wordpress
+```
+
+Publish to all configured platforms in one run:
 
 ```bash
 python orchestrator.py --platform all
+```
+
+Publish to a subset:
+
+```bash
+python orchestrator.py --platform bluesky,wordpress
 ```
 
 Publish behavior:
 
 - Uses idempotent job tracking in SQLite (`data/copierbot.db`) to avoid duplicate posts.
 - News run: uploads caption text plus a publish-time composited social image (`social_image  <timestamp>.jpg`) built from `assets/templates/system_log_card.png` with the generated image placed in the 1000x1000 square area at `(x=40, y=50)` within a 1080x1080 template.
+- WordPress news run: posts the original non-composited image via REST API with image first and caption text below.
+- WordPress publish date/time is set from the run folder timestamp (for example `2026-03-19-16-58-27`).
 - System log run: posts system-log text only.
-- `--platform` options: `mastodon` (default), `bluesky`, or `all`.
+- `--platform` options: `mastodon` (default), `bluesky`, `wordpress`, `all`, or comma-separated subsets.
 - On publish, Copierbot appends an AI disclosure line to post text for Mastodon and Bluesky.
 - Disclosure is appended at publish time only (caption/system_log output files remain unchanged).
 
 ## Monitor Mentions And Reply
 
-Process Mastodon mentions and auto-reply to wellbeing check-ins:
+Process Mastodon/Bluesky mentions and WordPress comments, then auto-reply to wellbeing check-ins:
 
 ```bash
 python engage.py
@@ -261,11 +280,12 @@ python engage.py --platform all --fetch-limit 30 --process-limit 30
 
 Behavior:
 
-- Supports `--platform mastodon|bluesky|all` (default `all`).
-- Fetches mention/reply notifications from selected platform(s).
+- Supports `--platform mastodon|bluesky|wordpress|all` (default `all`).
+- Fetches mention/reply notifications (Mastodon/Bluesky) and comments (WordPress) from selected platform(s).
 - Uses persisted platform cursors:
   - Mastodon: `data/mention_cursor.json` (`since_id`/`max_id` pagination)
   - Bluesky: `data/bluesky_mention_cursor.json` (newest notification URI marker)
+  - WordPress: `data/wordpress_comment_cursor.json` (highest seen comment id)
 - Stores mentions in SQLite and processes unhandled rows.
 - If mention text matches patterns like "How are you?", Copierbot generates a local `system_log` style reply and posts it as a reply.
 - Other mentions are marked handled with `no_reply` so they are not repeatedly reprocessed.
