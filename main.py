@@ -19,6 +19,7 @@ from image_gen import generate_image
 from news import choose_headline, get_headlines
 from persona import get_persona_context, get_persona_state, increment_post_counter
 from phase_event import save_phase_change_system_log
+from social_image import build_social_composite_image
 from social_posting import disclosure_overhead_chars
 from system_log import generate_system_log
 from system_log_card import card_path_for_system_log, render_system_log_card
@@ -162,6 +163,12 @@ def run_news_post(
             "Rendered local ASCII-art image instead."
         )
         logging.info("Saved ASCII fallback image to %s", image_path)
+
+    try:
+        social_image_path = build_social_composite_image(image_path)
+        logging.info("Saved social composite image to %s", social_image_path)
+    except Exception as exc:
+        logging.warning("Failed to build social composite image: %s", exc)
 
     logging.info("Generating caption...")
     caption = generate_caption(
