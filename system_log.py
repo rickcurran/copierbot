@@ -280,7 +280,11 @@ def _rewrite_system_log_to_limit(
 def generate_system_log(
     client: OpenAI, model: str, persona_context: str, max_chars: int | None = None
 ) -> str:
-    """Generate a dry, philosophical copier diagnostic post."""
+    """Generate a dry, philosophical copier diagnostic post.
+
+    Falls back to compact local generation when API calls fail or length
+    constraints cannot be satisfied after rewrite attempts.
+    """
     snapshot = _randomized_snapshot()
     length_instruction = "Keep it concise."
     if max_chars is not None:
@@ -306,29 +310,49 @@ def generate_system_log(
 
     try:
         response = client.responses.create(model=model, input=instruction, temperature=0.9)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to generate system log: {exc}") from exc
+    except Exception:
+        return generate_system_log_local(
+            persona_context=persona_context,
+            max_chars=max_chars,
+            compact=True,
+        )
 
     text = (response.output_text or "").strip()
     if not text:
-        raise RuntimeError("OpenAI returned an empty system log.")
+        return generate_system_log_local(
+            persona_context=persona_context,
+            max_chars=max_chars,
+            compact=True,
+        )
     text = _normalize_system_log_format(text)
+    if not text:
+        return generate_system_log_local(
+            persona_context=persona_context,
+            max_chars=max_chars,
+            compact=True,
+        )
 
     if max_chars is not None and _char_count(text) > max_chars:
         for _ in range(2):
-            text = _rewrite_system_log_to_limit(
-                client=client,
-                model=model,
-                text=text,
-                max_chars=max_chars,
-                persona_context=persona_context,
-            )
+            try:
+                text = _rewrite_system_log_to_limit(
+                    client=client,
+                    model=model,
+                    text=text,
+                    max_chars=max_chars,
+                    persona_context=persona_context,
+                )
+            except Exception:
+                text = ""
+                break
             text = _normalize_system_log_format(text)
             if text and _char_count(text) <= max_chars:
                 break
         if _char_count(text) > max_chars:
-            raise RuntimeError(
-                f"Generated system log exceeds {max_chars} characters after rewrite attempts."
+            return generate_system_log_local(
+                persona_context=persona_context,
+                max_chars=max_chars,
+                compact=True,
             )
 
     return text

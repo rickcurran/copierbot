@@ -158,6 +158,7 @@ WORDPRESS_USERNAME=your_wp_username
 WORDPRESS_APP_PASSWORD=xxxx xxxx xxxx xxxx xxxx xxxx
 WORDPRESS_POST_STATUS=publish
 WORDPRESS_TIMEOUT_SECONDS=30
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/xxx/yyy/zzz
 ```
 
 Post length modes:
@@ -206,8 +207,25 @@ Notes:
 - Header stats show current persona phase, total posts generated, and posts remaining to next phase.
 - Scheduled generate flow runs `main.py`, then publishes all newly created run folders from that cycle in creation order (normal post first, phase-change post second when present).
 - Selected scheduler intervals persist across dashboard stop/restart for both Generate+Publish and Mentions schedulers.
-- When starting Generate+Publish, if an active-platform post was already published within the selected interval window, the first run is delayed instead of firing immediately.
+- Generate+Publish supports a local start-time selector (`HH:MM`); if that time has already passed today, first run starts tomorrow at that time.
+- If scheduled generation fails with a fatal OpenAI error category (`quota_exhausted` or `auth_failed`), the Generate+Publish scheduler auto-stops and requires manual restart after fixing credentials/billing.
 - Recent Jobs output auto-links URLs (for example Mastodon/Bluesky/WordPress links) in job logs.
+
+## Error Alerts (Slack)
+
+Optional Slack alerts are supported via incoming webhook.
+
+Set in `.env`:
+
+```env
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/xxx/yyy/zzz
+```
+
+Behavior:
+
+- `main.py` sends a Slack alert when generation fails, including run folder and classified error category.
+- Scheduler sends an additional Slack alert when it auto-stops due to fatal OpenAI categories (`quota_exhausted`, `auth_failed`).
+- If `SLACK_WEBHOOK_URL` is missing, alerts are silently skipped.
 
 ## Publish To Social Platforms
 
@@ -313,6 +331,7 @@ copierbot/
     phase_event.py
     mention_archive.py
     article_context.py
+    alerts.py
     ascii_fallback.py
     persona.py
     system_log.py

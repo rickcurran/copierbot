@@ -19,6 +19,7 @@ import threading
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
+from alerts import classify_openai_error_text, is_fatal_openai_category, send_slack_alert
 from persona import get_persona_state
 from storage import init_storage, list_published_posts
 
@@ -32,6 +33,7 @@ HOST = "127.0.0.1"
 PORT = 8787
 RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?$")
 URL_RE = re.compile(r"https?://[^\s<>'\"]+")
+TIME_HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 GENERATE_INTERVAL_HOURS = list(range(1, 25))
 MENTION_INTERVAL_MINUTES = [1, 5, 10, 15, 20, 30, 60]
@@ -94,6 +96,8 @@ SCHEDULERS: dict[str, SchedulerState] = {
 }
 ACTIVE_PUBLISH_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS)
 ACTIVE_MENTION_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_MENTION_PLATFORMS)
+GENERATE_START_TIME = ""
+SCHED_STOP_PREFIX = "__SCHED_STOP__:"
 
 
 def _validate_generate_interval_seconds(value: int) -> int:
@@ -140,6 +144,12 @@ def _normalize_active_mention_platforms(raw_value: object) -> list[str]:
         if value in MENTION_PLATFORM_OPTIONS and value not in deduped:
             deduped.append(value)
     return deduped or list(DEFAULT_ACTIVE_MENTION_PLATFORMS)
+
+
+def _normalize_generate_start_time(raw_value: object) -> str:
+    """Normalize generate scheduler start time in HH:MM local format."""
+    value = str(raw_value or "").strip()
+    return value if TIME_HHMM_RE.match(value) else ""
 
 
 def _platform_display_name(name: str) -> str:
@@ -203,10 +213,26 @@ def _set_active_mention_platforms(platforms: list[str]) -> None:
         _save_scheduler_preferences()
 
 
+def _get_generate_start_time() -> str:
+    """Return configured generate scheduler start time in HH:MM local format."""
+    with SCHED_LOCK:
+        return GENERATE_START_TIME
+
+
+def _set_generate_start_time(start_time: str) -> None:
+    """Update generate scheduler start time and persist preferences."""
+    normalized = _normalize_generate_start_time(start_time)
+    with SCHED_LOCK:
+        global GENERATE_START_TIME
+        GENERATE_START_TIME = normalized
+        _save_scheduler_preferences()
+
+
 def _load_scheduler_preferences() -> dict[str, object]:
     """Load persisted scheduler interval preferences."""
     defaults = {
         "generate_publish_interval_seconds": 3600,
+        "generate_start_time": "",
         "mentions_interval_seconds": 300,
         "active_publish_platforms": list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS),
         "active_mention_platforms": list(DEFAULT_ACTIVE_MENTION_PLATFORMS),
@@ -234,6 +260,9 @@ def _load_scheduler_preferences() -> dict[str, object]:
                 defaults["generate_publish_interval_seconds"],
             )
         ),
+        "generate_start_time": _normalize_generate_start_time(
+            raw.get("generate_start_time", defaults["generate_start_time"])
+        ),
         "mentions_interval_seconds": _validate_mentions_interval_seconds(
             _safe_int(
                 raw.get("mentions_interval_seconds", defaults["mentions_interval_seconds"]),
@@ -257,6 +286,7 @@ def _save_scheduler_preferences() -> None:
     """Persist scheduler interval preferences to disk."""
     payload = {
         "generate_publish_interval_seconds": int(SCHEDULERS["generate_publish"].interval_seconds),
+        "generate_start_time": str(GENERATE_START_TIME),
         "mentions_interval_seconds": int(SCHEDULERS["mentions"].interval_seconds),
         "active_publish_platforms": list(ACTIVE_PUBLISH_PLATFORMS),
         "active_mention_platforms": list(ACTIVE_MENTION_PLATFORMS),
@@ -268,7 +298,9 @@ def _save_scheduler_preferences() -> None:
 def _apply_scheduler_preferences() -> None:
     """Apply persisted preferences to in-memory scheduler defaults."""
     prefs = _load_scheduler_preferences()
+    global GENERATE_START_TIME
     SCHEDULERS["generate_publish"].interval_seconds = int(prefs["generate_publish_interval_seconds"])
+    GENERATE_START_TIME = _normalize_generate_start_time(prefs.get("generate_start_time"))
     SCHEDULERS["mentions"].interval_seconds = int(prefs["mentions_interval_seconds"])
     ACTIVE_PUBLISH_PLATFORMS.clear()
     ACTIVE_PUBLISH_PLATFORMS.extend(
@@ -293,9 +325,25 @@ def _now_stamp() -> str:
     return _now_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _stamp_from_dt(value: datetime) -> str:
+    """Return local timestamp string for a datetime."""
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _future_stamp(seconds: int) -> str:
     """Return local timestamp offset by given seconds."""
     return (_now_dt() + timedelta(seconds=max(0, int(seconds)))).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _next_occurrence_for_time(start_time_hhmm: str, now: datetime | None = None) -> datetime:
+    """Return next local datetime occurrence for HH:MM, rolling to tomorrow if passed."""
+    current = now.astimezone() if now is not None else _now_dt()
+    hour, minute = [int(part) for part in start_time_hhmm.split(":", 1)]
+    candidate = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # If selected clock time has already passed today, schedule first run tomorrow.
+    if candidate < current and not (current.hour == hour and current.minute == minute):
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def _is_publishable_run_dir(path: Path) -> bool:
@@ -536,7 +584,23 @@ def _run_generate_publish_cycle() -> str:
     )
     try:
         if gen_job.status != "succeeded":
-            return f"main.py failed (rc={gen_job.return_code})."
+            category = classify_openai_error_text(gen_job.output or "")
+            base_message = (
+                f"main.py failed (rc={gen_job.return_code}, "
+                f"openai_category={category})."
+            )
+            if is_fatal_openai_category(category):
+                send_slack_alert(
+                    title="Copierbot scheduler auto-stopped",
+                    message=(
+                        "Generate + Publish halted due to fatal OpenAI error category.\n"
+                        f"Category: `{category}`\n"
+                        f"Job: `Scheduled Generate Post`\n"
+                        "Action: scheduler stopped; intervention required."
+                    ),
+                )
+                return f"{SCHED_STOP_PREFIX}{base_message} Scheduler auto-stopped."
+            return base_message
 
         created = _parse_run_manifest(manifest_path)
         if not created:
@@ -615,11 +679,23 @@ def _scheduler_loop(
         except Exception as exc:  # defensive, runner already handles subprocess statuses
             result = f"runner error: {exc}"
 
+        stop_requested = False
+        if isinstance(result, str) and result.startswith(SCHED_STOP_PREFIX):
+            stop_requested = True
+            result = result[len(SCHED_STOP_PREFIX) :].strip()
+
         with SCHED_LOCK:
             if not state.running:
                 break
             state.last_result = result
-            state.next_run_at = _future_stamp(state.interval_seconds)
+            if stop_requested:
+                state.running = False
+                state.next_run_at = ""
+            else:
+                state.next_run_at = _future_stamp(state.interval_seconds)
+
+        if stop_requested:
+            break
 
         if stop_event.wait(state.interval_seconds):
             break
@@ -657,6 +733,7 @@ def _start_scheduler(
     runner: Callable[[], str],
     initial_delay_seconds: int = 0,
     queued_message: str = "queued",
+    initial_next_run_at: str = "",
 ) -> None:
     """Start scheduler with given interval, restarting if already running."""
     _stop_scheduler(key)
@@ -676,7 +753,10 @@ def _start_scheduler(
         _save_scheduler_preferences()
         state.running = True
         state.last_result = queued_message
-        state.next_run_at = _future_stamp(delay) if delay > 0 else _now_stamp()
+        if initial_next_run_at:
+            state.next_run_at = initial_next_run_at
+        else:
+            state.next_run_at = _future_stamp(delay) if delay > 0 else _now_stamp()
         state.stop_event = stop_event
         state.thread = thread
 
@@ -797,6 +877,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 _enqueue_job(label=label, command=command, background=True)
         elif action == "start_generate_scheduler":
             hours_raw = (payload.get("generate_interval_hours") or "1").strip()
+            start_time_raw = (payload.get("generate_start_time") or "").strip()
             try:
                 hours = int(hours_raw)
             except ValueError:
@@ -804,23 +885,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if hours not in GENERATE_INTERVAL_HOURS:
                 hours = 1
             interval_seconds = hours * 60 * 60
-            active_platforms = _get_active_publish_platforms()
-            initial_delay_seconds = _compute_generate_initial_delay(
-                interval_seconds, active_platforms
+            start_time = _normalize_generate_start_time(start_time_raw)
+            if not start_time:
+                persisted = _normalize_generate_start_time(_get_generate_start_time())
+                start_time = persisted or _now_dt().strftime("%H:%M")
+            _set_generate_start_time(start_time)
+
+            now_local = _now_dt()
+            first_run_local = _next_occurrence_for_time(start_time, now=now_local)
+            initial_delay_seconds = int(
+                max(0, math.ceil((first_run_local - now_local).total_seconds()))
             )
-            queued_message = "queued"
-            if initial_delay_seconds > 0:
-                queued_message = (
-                    "waiting "
-                    f"{_format_wait_duration(initial_delay_seconds)}; "
-                    f"recent publish detected for {_active_publish_platform_arg(active_platforms)}."
-                )
+            queued_message = (
+                f"queued for {_stamp_from_dt(first_run_local)} "
+                f"(local); then every {hours}h."
+            )
             _start_scheduler(
                 key="generate_publish",
                 interval_seconds=interval_seconds,
                 runner=_run_generate_publish_cycle,
                 initial_delay_seconds=initial_delay_seconds,
                 queued_message=queued_message,
+                initial_next_run_at=_stamp_from_dt(first_run_local),
             )
         elif action == "stop_generate_scheduler":
             _stop_scheduler("generate_publish")
@@ -876,6 +962,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         active_publish_platforms = _get_active_publish_platforms()
         active_publish_platform_arg = _active_publish_platform_arg(active_publish_platforms)
         active_publish_platforms_label = _platforms_display_label(active_publish_platforms)
+        configured_generate_start_time = (
+            _normalize_generate_start_time(_get_generate_start_time())
+            or _now_dt().strftime("%H:%M")
+        )
         active_mention_platforms = _get_active_mention_platforms()
         active_mention_platform_arg = _active_mention_platform_arg(active_mention_platforms)
         active_mention_platforms_label = _platforms_display_label(active_mention_platforms)
@@ -1021,6 +1111,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
       border: 1px solid var(--border);
       background: #fff;
     }}
+    input[type="time"] {{
+      width: 100%;
+      margin-bottom: 0.5rem;
+      padding: 0.5rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+    }}
     .jobs {{ margin-top: 1rem; }}
     .job {{
       background: var(--card);
@@ -1104,15 +1202,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
       <div class="card">
         <h2>Scheduler: Generate + Publish</h2>
-        <p class="hint">Runs <code>main.py</code>, then publishes all new run folders from that cycle in creation order (normal post first, phase-change post second when present) to active destinations.</p>
+        <p class="hint">Runs <code>main.py</code>, then publishes all new run folders from that cycle in creation order (normal post first, phase-change post second when present) to active destinations. Choose an interval and local start time; if the chosen time has passed today, first run starts tomorrow at that time.</p>
         <div class="sched-status {'running' if bool(gp['running']) else 'stopped'}">{'running' if bool(gp['running']) else 'stopped'}</div>
         <p class="sched-meta">Active platforms: {html.escape(active_publish_platforms_label)}</p>
+        <p class="sched-meta">Start time (local): {html.escape(configured_generate_start_time)}</p>
         <p class="sched-meta">Last run: {html.escape(str(gp['last_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Next run: {html.escape(str(gp['next_run_at']) or 'N/A')}</p>
         <p class="sched-meta">Last result: {html.escape(str(gp['last_result']) or 'N/A')}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="start_generate_scheduler" />
           <select name="generate_interval_hours">{gp_options}</select>
+          <input type="time" name="generate_start_time" value="{html.escape(configured_generate_start_time)}" step="60" />
           <button type="submit">Start / Update Generate Scheduler</button>
         </form>
         <form method="post" action="/run" style="margin-top:0.5rem;">

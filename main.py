@@ -4,12 +4,14 @@ import argparse
 import logging
 import random
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 from openai import OpenAI
 
 from article_context import build_article_context
+from alerts import classify_openai_error_text, send_slack_alert
 from ascii_fallback import create_ascii_fallback_image
 from anonymize import anonymize_headline_names
 from caption import generate_caption
@@ -242,61 +244,90 @@ def run(run_manifest_path: Path | None = None) -> None:
     client = OpenAI(api_key=settings.openai_api_key)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     image_path, prompt_path, caption_path, system_log_path, run_dir = build_output_paths()
+    run_dir_path = Path(run_dir).resolve()
     logging.info("Output folder for this run: %s", run_dir)
-    created_run_dirs: list[Path] = [Path(run_dir).resolve()]
-    persona_context = get_persona_context()
-    logging.info("Persona context loaded.")
-    logging.info("Post mode: %s", settings.post_mode)
-    logging.info(
-        "Generation char limit: %d (min of Mastodon=%d, Bluesky=%d minus disclosure overhead=%d)",
-        get_generation_char_limit(settings),
-        settings.mastodon_max_chars,
-        settings.bluesky_max_chars,
-        disclosure_overhead_chars(),
-    )
+    created_run_dirs: list[Path] = [run_dir_path]
 
-    post_type = choose_post_type()
-    logging.info("Selected post type: %s", post_type)
-    if post_type == "system_log":
-        run_system_log_post(
-            client=client,
-            settings=settings,
-            persona_context=persona_context,
-            system_log_path=system_log_path,
-        )
-    else:
-        run_news_post(
-            client=client,
-            settings=settings,
-            persona_context=persona_context,
-            image_path=image_path,
-            prompt_path=prompt_path,
-            caption_path=caption_path,
+    try:
+        persona_context = get_persona_context()
+        logging.info("Persona context loaded.")
+        logging.info("Post mode: %s", settings.post_mode)
+        logging.info(
+            "Generation char limit: %d (min of Mastodon=%d, Bluesky=%d minus disclosure overhead=%d)",
+            get_generation_char_limit(settings),
+            settings.mastodon_max_chars,
+            settings.bluesky_max_chars,
+            disclosure_overhead_chars(),
         )
 
-    previous_state = get_persona_state()
-    new_state = increment_post_counter()
-    logging.info(
-        "Persona updated -> phase: %s, posts_generated: %d",
-        new_state["phase"],
-        new_state["posts_generated"],
-    )
-    if previous_state["phase"] != new_state["phase"]:
-        phase_log_path = save_phase_change_system_log(
-            output_root=OUTPUT_DIR,
-            previous_phase=previous_state["phase"],
-            new_phase=new_state["phase"],
-            posts_generated=new_state["posts_generated"],
-            max_chars=250,
+        post_type = choose_post_type()
+        logging.info("Selected post type: %s", post_type)
+        if post_type == "system_log":
+            run_system_log_post(
+                client=client,
+                settings=settings,
+                persona_context=persona_context,
+                system_log_path=system_log_path,
+            )
+        else:
+            run_news_post(
+                client=client,
+                settings=settings,
+                persona_context=persona_context,
+                image_path=image_path,
+                prompt_path=prompt_path,
+                caption_path=caption_path,
+            )
+
+        previous_state = get_persona_state()
+        new_state = increment_post_counter()
+        logging.info(
+            "Persona updated -> phase: %s, posts_generated: %d",
+            new_state["phase"],
+            new_state["posts_generated"],
         )
-        logging.info("Saved phase-change system log to %s", phase_log_path)
-        created_run_dirs.append(phase_log_path.parent.resolve())
+        if previous_state["phase"] != new_state["phase"]:
+            phase_log_path = save_phase_change_system_log(
+                output_root=OUTPUT_DIR,
+                previous_phase=previous_state["phase"],
+                new_phase=new_state["phase"],
+                posts_generated=new_state["posts_generated"],
+                max_chars=250,
+            )
+            logging.info("Saved phase-change system log to %s", phase_log_path)
+            created_run_dirs.append(phase_log_path.parent.resolve())
 
-    if run_manifest_path is not None:
-        _write_run_manifest(run_manifest_path, created_run_dirs)
-        logging.info("Wrote run manifest to %s", run_manifest_path)
+        if run_manifest_path is not None:
+            _write_run_manifest(run_manifest_path, created_run_dirs)
+            logging.info("Wrote run manifest to %s", run_manifest_path)
 
-    logging.info("Copierbot run complete.")
+        logging.info("Copierbot run complete.")
+    except Exception as exc:
+        error_path = run_dir_path / f"error  {run_dir_path.name}.txt"
+        traceback_text = traceback.format_exc().strip()
+        error_payload = (
+            f"Pipeline failed: {exc}\n\n"
+            f"Traceback:\n{traceback_text}\n"
+        )
+        try:
+            save_text(error_path, error_payload)
+            logging.error("Saved run failure details to %s", error_path)
+        except Exception:
+            logging.error("Failed to write run failure details to %s", error_path)
+
+        category = classify_openai_error_text(f"{exc}\n{traceback_text}")
+        alert_sent = send_slack_alert(
+            title="Copierbot generation failed",
+            message=(
+                f"Category: `{category}`\n"
+                f"Run folder: `{run_dir_path}`\n"
+                f"Error file: `{error_path.name}`\n"
+                f"Error: {str(exc).strip() or 'unknown error'}"
+            ),
+        )
+        if alert_sent:
+            logging.error("Sent Slack alert for pipeline failure (%s).", category)
+        raise
 
 
 if __name__ == "__main__":
