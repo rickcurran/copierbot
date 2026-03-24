@@ -652,6 +652,54 @@ def _run_mention_cycle() -> str:
     return f"engage.py failed (platform={platform_arg}, rc={job.return_code})."
 
 
+def _start_generate_scheduler_from_settings(
+    hours: int | None = None, start_time_raw: str | None = None
+) -> None:
+    """Start generate scheduler using explicit values or persisted settings."""
+    if hours is None:
+        hours = max(1, int(SCHEDULERS["generate_publish"].interval_seconds) // 3600)
+    if hours not in GENERATE_INTERVAL_HOURS:
+        hours = 1
+    interval_seconds = hours * 60 * 60
+
+    start_time = _normalize_generate_start_time(start_time_raw or "")
+    if not start_time:
+        persisted = _normalize_generate_start_time(_get_generate_start_time())
+        start_time = persisted or _now_dt().strftime("%H:%M")
+    _set_generate_start_time(start_time)
+
+    now_local = _now_dt()
+    first_run_local = _next_occurrence_for_time(start_time, now=now_local)
+    initial_delay_seconds = int(
+        max(0, math.ceil((first_run_local - now_local).total_seconds()))
+    )
+    queued_message = (
+        f"queued for {_stamp_from_dt(first_run_local)} "
+        f"(local); then every {hours}h."
+    )
+    _start_scheduler(
+        key="generate_publish",
+        interval_seconds=interval_seconds,
+        runner=_run_generate_publish_cycle,
+        initial_delay_seconds=initial_delay_seconds,
+        queued_message=queued_message,
+        initial_next_run_at=_stamp_from_dt(first_run_local),
+    )
+
+
+def _start_mentions_scheduler_from_settings(minutes: int | None = None) -> None:
+    """Start mention scheduler using explicit values or persisted settings."""
+    if minutes is None:
+        minutes = max(1, int(SCHEDULERS["mentions"].interval_seconds) // 60)
+    if minutes not in MENTION_INTERVAL_MINUTES:
+        minutes = 5
+    _start_scheduler(
+        key="mentions",
+        interval_seconds=minutes * 60,
+        runner=_run_mention_cycle,
+    )
+
+
 def _scheduler_loop(
     state: SchedulerState,
     runner: Callable[[], str],
@@ -882,32 +930,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hours = int(hours_raw)
             except ValueError:
                 hours = 1
-            if hours not in GENERATE_INTERVAL_HOURS:
-                hours = 1
-            interval_seconds = hours * 60 * 60
-            start_time = _normalize_generate_start_time(start_time_raw)
-            if not start_time:
-                persisted = _normalize_generate_start_time(_get_generate_start_time())
-                start_time = persisted or _now_dt().strftime("%H:%M")
-            _set_generate_start_time(start_time)
-
-            now_local = _now_dt()
-            first_run_local = _next_occurrence_for_time(start_time, now=now_local)
-            initial_delay_seconds = int(
-                max(0, math.ceil((first_run_local - now_local).total_seconds()))
-            )
-            queued_message = (
-                f"queued for {_stamp_from_dt(first_run_local)} "
-                f"(local); then every {hours}h."
-            )
-            _start_scheduler(
-                key="generate_publish",
-                interval_seconds=interval_seconds,
-                runner=_run_generate_publish_cycle,
-                initial_delay_seconds=initial_delay_seconds,
-                queued_message=queued_message,
-                initial_next_run_at=_stamp_from_dt(first_run_local),
-            )
+            _start_generate_scheduler_from_settings(hours=hours, start_time_raw=start_time_raw)
         elif action == "stop_generate_scheduler":
             _stop_scheduler("generate_publish")
         elif action == "start_mentions_scheduler":
@@ -916,13 +939,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 minutes = int(mins_raw)
             except ValueError:
                 minutes = 5
-            if minutes not in MENTION_INTERVAL_MINUTES:
-                minutes = 5
-            _start_scheduler(
-                key="mentions",
-                interval_seconds=minutes * 60,
-                runner=_run_mention_cycle,
-            )
+            _start_mentions_scheduler_from_settings(minutes=minutes)
         elif action == "stop_mentions_scheduler":
             _stop_scheduler("mentions")
 
@@ -1342,6 +1359,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def run_server() -> None:
     """Run local-only dashboard server."""
+    _start_generate_scheduler_from_settings()
+    _start_mentions_scheduler_from_settings()
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
     print(f"Copierbot dashboard listening on http://{HOST}:{PORT}")
     try:
