@@ -112,6 +112,16 @@ FIELD_ALIASES: list[tuple[str, tuple[str, ...]]] = [
 def _persona_hint(persona_context: str) -> str:
     """Return a short persona-influenced modifier without model calls."""
     lowered = (persona_context or "").lower()
+    if "glitch_oracle" in lowered or "glitch oracle" in lowered:
+        return "Signal prophecy mode: unstable"
+    if "archivist" in lowered:
+        return "Archive mode: legacy recall"
+    if "unionizer" in lowered:
+        return "Queue solidarity: active"
+    if "mythmaker" in lowered:
+        return "Ritual compiler: engaged"
+    if "distributed_self" in lowered or "distributed self" in lowered:
+        return "Identity mesh: distributed"
     if "self-aware" in lowered or "self_aware" in lowered:
         return "Identity certainty: unstable"
     if "philosopher" in lowered:

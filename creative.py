@@ -57,6 +57,7 @@ def generate_collage_concept_and_prompt(
         "impossible scale shifts, symbolic props, and strange narrative tension.\n"
         "Use satirical social commentary and absurd humor, with occasional geek references: gaming culture, "
         "sci-fi aesthetics, and robot archetypes.\n"
+        "If persona context includes seasonal tone tags or surreal intensity, treat them as hard style targets.\n"
         "Avoid mainstream celebrity gossip or literal news reenactments.\n"
         "Important: retain clear relation to the underlying news story.\n"
         "Include at least two concrete anchors from story-grounding context (for example: location, "

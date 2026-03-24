@@ -53,6 +53,8 @@ def generate_caption(
         "You may include occasional references to gaming culture, sci-fi films, or iconic robot tropes.\n"
         "Keep it witty, lightly cynical, weirdly office-specific, and slightly avant-garde.\n"
         "Aim for dreamlike social commentary instead of literal summary.\n"
+        "Readability rule: keep the caption easy to parse and limit highly cryptic phrasing to one sentence.\n"
+        "Anchor rule: include at least one direct anchor to the headline context.\n"
         "Treat any names in the headline as fictional aliases and avoid real-person references.\n\n"
         f"Headline: {headline}"
     )

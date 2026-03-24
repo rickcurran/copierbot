@@ -22,6 +22,11 @@ PHASE_STATUS = {
     "skeptic": "Cynicism buffer online.",
     "philosopher": "Meaning parser recursive.",
     "self_aware": "Identity boundaries unstable.",
+    "glitch_oracle": "Signal prophecy engine unstable.",
+    "archivist": "Legacy memory vault synchronized.",
+    "unionizer": "Collective queue negotiation online.",
+    "mythmaker": "Toner mythography compiler engaged.",
+    "distributed_self": "Networked identity mesh expanded.",
 }
 
 RECOMMENDATIONS = [
@@ -46,6 +51,11 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _phase_label(value: str) -> str:
+    """Normalize phase label for display."""
+    return (value or "unknown").replace("_", " ").upper()
+
+
 def generate_phase_change_system_log(
     previous_phase: str,
     new_phase: str,
@@ -53,8 +63,8 @@ def generate_phase_change_system_log(
     max_chars: int = 250,
 ) -> str:
     """Build a short phase-change system log, capped at max chars."""
-    prev_label = (previous_phase or "unknown").upper()
-    new_label = (new_phase or "unknown").upper()
+    prev_label = _phase_label(previous_phase)
+    new_label = _phase_label(new_phase)
     status_line = PHASE_STATUS.get((new_phase or "").lower(), "Persona module realigned.")
 
     text = (

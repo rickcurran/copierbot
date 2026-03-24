@@ -29,12 +29,19 @@ Running `python main.py` now chooses a post type:
 
 ## Persona evolution
 
-Copierbot has 4 phases:
+Copierbot now has two layers of persona evolution:
 
-1. `observer`
-2. `skeptic`
-3. `philosopher`
-4. `self_aware`
+1. Major phase progression (first arc):
+   - `observer`
+   - `skeptic`
+   - `philosopher`
+   - `self_aware`
+2. Seasonal phase progression (ongoing after post 60, rotates every 40 posts):
+   - `glitch_oracle`
+   - `archivist`
+   - `unionizer`
+   - `mythmaker`
+   - `distributed_self`
 
 State file:
 
@@ -45,14 +52,19 @@ Format:
 ```json
 {
   "phase": "observer",
-  "posts_generated": 0
+  "posts_generated": 0,
+  "seasonal_phase": "none",
+  "season_index": 0,
+  "season_cycle": 0,
+  "season_post_offset": 0
 }
 ```
 
 Evolution rule:
 
 - After every 20 generated posts, Copierbot advances to the next phase.
-- Phase stops advancing after `self_aware`.
+- Major phase stops advancing after `self_aware`.
+- Seasonal phases begin at post `61`, advance every `40` posts, and loop indefinitely.
 
 Persona context is injected into:
 
@@ -96,7 +108,7 @@ The fallback mood is influenced by the API error category (for example: safety r
 
 - `output/<timestamp>/system_log  <timestamp>.txt`
 - `output/<timestamp>/system_log_card  <timestamp>.png`
-- On persona phase transitions (every 20 posts), Copierbot creates an additional normal timestamped system-log run folder (local-only, <=250 chars).
+- On persona transitions (major and seasonal), Copierbot creates additional normal timestamped system-log run folders (local-only, <=250 chars).
 
 ## Headline filtering behavior
 

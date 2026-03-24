@@ -954,6 +954,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _render_index(self) -> None:
         runs = _list_run_dirs()
         persona_state = get_persona_state()
+        seasonal_phase_raw = str(persona_state.get("seasonal_phase", "none"))
+        seasonal_phase_label = (
+            "N/A"
+            if seasonal_phase_raw == "none"
+            else seasonal_phase_raw.replace("_", " ").upper()
+        )
+        seasonal_offset = max(0, int(persona_state.get("season_post_offset", 0)))
+        next_seasonal_in = (
+            0 if seasonal_phase_raw == "none" else max(1, 40 - seasonal_offset)
+        )
         sched = _scheduler_snapshot()
         with JOB_LOCK:
             jobs = list(reversed(JOBS))
@@ -1187,8 +1197,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <div class="v">{html.escape(str(persona_state["phase"]).upper())}</div>
       </div>
       <div class="stat">
-        <div class="k">Next Phase In</div>
+        <div class="k">Next Major Phase In</div>
         <div class="v">{20 - (int(persona_state["posts_generated"]) % 20) if str(persona_state["phase"]) != "self_aware" else 0}</div>
+      </div>
+      <div class="stat">
+        <div class="k">Seasonal Phase</div>
+        <div class="v">{html.escape(seasonal_phase_label)}</div>
+      </div>
+      <div class="stat">
+        <div class="k">Next Seasonal Shift In</div>
+        <div class="v">{int(next_seasonal_in)}</div>
       </div>
     </div>
 

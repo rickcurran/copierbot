@@ -282,8 +282,14 @@ def run(run_manifest_path: Path | None = None) -> None:
         previous_state = get_persona_state()
         new_state = increment_post_counter()
         logging.info(
-            "Persona updated -> phase: %s, posts_generated: %d",
+            (
+                "Persona updated -> phase: %s, seasonal_phase: %s, "
+                "season_cycle: %d, season_offset: %d, posts_generated: %d"
+            ),
             new_state["phase"],
+            new_state.get("seasonal_phase", "none"),
+            int(new_state.get("season_cycle", 0)),
+            int(new_state.get("season_post_offset", 0)) + 1,
             new_state["posts_generated"],
         )
         if previous_state["phase"] != new_state["phase"]:
@@ -296,6 +302,23 @@ def run(run_manifest_path: Path | None = None) -> None:
             )
             logging.info("Saved phase-change system log to %s", phase_log_path)
             created_run_dirs.append(phase_log_path.parent.resolve())
+
+        previous_seasonal = str(previous_state.get("seasonal_phase", "none"))
+        new_seasonal = str(new_state.get("seasonal_phase", "none"))
+        if (
+            previous_seasonal != new_seasonal
+            and previous_seasonal != "none"
+            and new_seasonal != "none"
+        ):
+            seasonal_log_path = save_phase_change_system_log(
+                output_root=OUTPUT_DIR,
+                previous_phase=previous_seasonal,
+                new_phase=new_seasonal,
+                posts_generated=new_state["posts_generated"],
+                max_chars=250,
+            )
+            logging.info("Saved seasonal phase-change system log to %s", seasonal_log_path)
+            created_run_dirs.append(seasonal_log_path.parent.resolve())
 
         if run_manifest_path is not None:
             _write_run_manifest(run_manifest_path, created_run_dirs)

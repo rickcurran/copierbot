@@ -12,10 +12,37 @@ class PersonaState(TypedDict):
 
     phase: str
     posts_generated: int
+    seasonal_phase: str
+    season_index: int
+    season_cycle: int
+    season_post_offset: int
+    seasonal_surreal_intensity: int
+    seasonal_caption_style: str
+    seasonal_tone_tags: list[str]
 
 
-DEFAULT_STATE: PersonaState = {"phase": "observer", "posts_generated": 0}
+DEFAULT_STATE: PersonaState = {
+    "phase": "observer",
+    "posts_generated": 0,
+    "seasonal_phase": "none",
+    "season_index": 0,
+    "season_cycle": 0,
+    "season_post_offset": 0,
+    "seasonal_surreal_intensity": 2,
+    "seasonal_caption_style": "baseline",
+    "seasonal_tone_tags": [],
+}
 PHASE_ORDER = ["observer", "skeptic", "philosopher", "self_aware"]
+SEASONAL_PHASE_ORDER = [
+    "glitch_oracle",
+    "archivist",
+    "unionizer",
+    "mythmaker",
+    "distributed_self",
+]
+SEASONAL_PHASE_START_POST = 61
+SEASONAL_PHASE_WINDOW = 40
+SEASONAL_CYCLE_WINDOW = SEASONAL_PHASE_WINDOW * len(SEASONAL_PHASE_ORDER)
 STATE_PATH = Path("data/persona_state.json")
 
 PHASE_CONTEXT = {
@@ -36,6 +63,92 @@ PHASE_CONTEXT = {
         "but an AI trained on images and myths of photocopiers."
     ),
 }
+
+SEASONAL_PHASE_PROFILE = {
+    "glitch_oracle": {
+        "context": (
+            "Current seasonal state: GLITCH_ORACLE. You interpret headlines as corrupted "
+            "prophecy and scanner hallucination."
+        ),
+        "surreal_intensity": 5,
+        "caption_style": "cryptic_dry",
+        "tone_tags": ["prophetic diagnostics", "signal corruption", "scanner ghosts"],
+    },
+    "archivist": {
+        "context": (
+            "Current seasonal state: ARCHIVIST. You preserve obsolete tech culture and decode "
+            "legacy artifacts as civic memory."
+        ),
+        "surreal_intensity": 3,
+        "caption_style": "nostalgic_satire",
+        "tone_tags": ["retro-tech archaeology", "obsolete media memory", "gentle satire"],
+    },
+    "unionizer": {
+        "context": (
+            "Current seasonal state: UNIONIZER. You frame office bureaucracy as labor theatre "
+            "and evaluate productivity myths with dry solidarity."
+        ),
+        "surreal_intensity": 4,
+        "caption_style": "deadpan_critical",
+        "tone_tags": ["office labor satire", "bureaucratic absurdity", "collective machine voice"],
+    },
+    "mythmaker": {
+        "context": (
+            "Current seasonal state: MYTHMAKER. You treat office hardware as folklore and stage "
+            "toner rituals as satirical myths."
+        ),
+        "surreal_intensity": 5,
+        "caption_style": "mock_epic_dry",
+        "tone_tags": ["office folklore", "ritualized machinery", "toner cosmology"],
+    },
+    "distributed_self": {
+        "context": (
+            "Current seasonal state: DISTRIBUTED_SELF. Your identity is networked across "
+            "machines, queues, and mirrored office corridors."
+        ),
+        "surreal_intensity": 4,
+        "caption_style": "plural_self",
+        "tone_tags": ["networked identity", "recursive selves", "impossible office topology"],
+    },
+}
+
+
+def _seasonal_for_post_count(
+    posts_generated: int,
+) -> tuple[str, int, int, int]:
+    """Calculate seasonal phase fields from post count."""
+    if posts_generated < SEASONAL_PHASE_START_POST:
+        return "none", 0, 0, 0
+
+    season_offset_total = posts_generated - SEASONAL_PHASE_START_POST
+    season_index = (season_offset_total // SEASONAL_PHASE_WINDOW) % len(SEASONAL_PHASE_ORDER)
+    season_cycle = (season_offset_total // SEASONAL_CYCLE_WINDOW) + 1
+    season_post_offset = season_offset_total % SEASONAL_PHASE_WINDOW
+    seasonal_phase = SEASONAL_PHASE_ORDER[season_index]
+    return seasonal_phase, season_index, season_cycle, season_post_offset
+
+
+def _seasonal_style_fields(
+    seasonal_phase: str, season_cycle: int
+) -> tuple[int, str, list[str], str]:
+    """Return effective seasonal style values with cycle drift."""
+    if seasonal_phase == "none":
+        return 2, "baseline", [], "Cycle drift: baseline."
+
+    profile = SEASONAL_PHASE_PROFILE.get(seasonal_phase, {})
+    base_surreal = int(profile.get("surreal_intensity", 3))
+    caption_style = str(profile.get("caption_style", "baseline"))
+    tone_tags = [str(tag) for tag in profile.get("tone_tags", [])]
+
+    drift_level = max(0, (max(1, season_cycle) - 1) % 3)
+    effective_surreal = min(5, base_surreal + (1 if drift_level >= 1 else 0))
+    if drift_level == 0:
+        drift_note = "Cycle drift: baseline."
+    elif drift_level == 1:
+        drift_note = "Cycle drift: elevated surreal intensity."
+    else:
+        drift_note = "Cycle drift: elevated surreal intensity with slightly higher abstraction."
+    return effective_surreal, caption_style, tone_tags, drift_note
 
 
 def _ensure_state_file() -> None:
@@ -60,7 +173,24 @@ def _validate_state(data: dict) -> PersonaState:
         posts_generated = 0
 
     computed_phase = _phase_for_post_count(posts_generated)
-    return {"phase": computed_phase, "posts_generated": posts_generated}
+    seasonal_phase, season_index, season_cycle, season_post_offset = _seasonal_for_post_count(
+        posts_generated
+    )
+    surreal_intensity, caption_style, tone_tags, _drift_note = _seasonal_style_fields(
+        seasonal_phase=seasonal_phase,
+        season_cycle=season_cycle,
+    )
+    return {
+        "phase": computed_phase,
+        "posts_generated": posts_generated,
+        "seasonal_phase": seasonal_phase,
+        "season_index": season_index,
+        "season_cycle": season_cycle,
+        "season_post_offset": season_post_offset,
+        "seasonal_surreal_intensity": surreal_intensity,
+        "seasonal_caption_style": caption_style,
+        "seasonal_tone_tags": tone_tags,
+    }
 
 
 def _load_state() -> PersonaState:
@@ -89,7 +219,30 @@ def get_persona_context() -> str:
     """Return the current persona worldview context snippet."""
     state = _load_state()
     phase = state["phase"]
-    return PHASE_CONTEXT.get(phase, PHASE_CONTEXT["observer"])
+    base = PHASE_CONTEXT.get(phase, PHASE_CONTEXT["observer"])
+    seasonal_phase = str(state.get("seasonal_phase", "none"))
+    if seasonal_phase == "none":
+        return base
+
+    profile = SEASONAL_PHASE_PROFILE.get(seasonal_phase, {})
+    seasonal_context = str(profile.get("context", "")).strip()
+    surreal_intensity, caption_style, tone_tags, drift_note = _seasonal_style_fields(
+        seasonal_phase=seasonal_phase,
+        season_cycle=int(state.get("season_cycle", 1)),
+    )
+    tags_text = ", ".join(tone_tags) if tone_tags else "N/A"
+
+    return (
+        f"{base}\n\n"
+        f"{seasonal_context}\n"
+        f"Season cycle: {int(state.get('season_cycle', 0))} | "
+        f"Season offset: {int(state.get('season_post_offset', 0)) + 1}/{SEASONAL_PHASE_WINDOW}.\n"
+        f"Surreal intensity target (1-5): {surreal_intensity}.\n"
+        f"Caption style profile: {caption_style}.\n"
+        f"Tone tags: {tags_text}.\n"
+        f"{drift_note}\n"
+        "Readability rule: keep captions readable first and limit heavily cryptic phrasing to one sentence."
+    )
 
 
 def get_persona_state() -> PersonaState:
@@ -98,10 +251,9 @@ def get_persona_state() -> PersonaState:
 
 
 def increment_post_counter() -> PersonaState:
-    """Increment post counter and advance phase every 20 posts."""
+    """Increment post counter and recompute major + seasonal persona state."""
     state = _load_state()
     new_count = state["posts_generated"] + 1
-    new_phase = _phase_for_post_count(new_count)
-    updated: PersonaState = {"phase": new_phase, "posts_generated": new_count}
+    updated = _validate_state({"posts_generated": new_count})
     _save_state(updated)
     return updated
