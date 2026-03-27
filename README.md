@@ -2,6 +2,10 @@
 
 Copierbot is a local Python CLI project that simulates an AI office photocopier generating surreal robot-themed art posts.
 
+## Handoff
+
+For cross-machine/session continuity, read `HANDOFF.md` first.
+
 ## What it does
 
 Running `python main.py` now chooses a post type:
