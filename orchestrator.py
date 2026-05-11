@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import logging
+import os
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from alerts import send_slack_alert
 from social.bluesky_adapter import BlueskyAdapter, BlueskyAPIError, load_bluesky_config
+from social.instagram_adapter import InstagramAdapter, InstagramAPIError, load_instagram_config
 from social_image import build_social_composite_image
 from social.mastodon_adapter import MastodonAdapter, MastodonAPIError, load_mastodon_config
 from social_posting import append_ai_disclosure
@@ -21,12 +25,13 @@ from storage import (
     update_post_job_status,
     upsert_post_artifacts,
 )
+from system_log_card import card_path_for_system_log, render_system_log_card
 
 
 OUTPUT_DIR = Path("output")
 RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?$")
 RUN_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})(?:-\d+)?$")
-PUBLISH_PLATFORM_ORDER = ("mastodon", "bluesky", "wordpress")
+PUBLISH_PLATFORM_ORDER = ("mastodon", "bluesky", "wordpress", "instagram")
 
 
 def _setup_logging() -> None:
@@ -36,6 +41,32 @@ def _setup_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+def _send_publish_failure_alert(
+    *,
+    run_dir: Path | None,
+    requested_platforms: list[str],
+    failed_platform: str = "",
+    post_type: str = "",
+    error: str,
+) -> None:
+    """Send a Slack alert for a publish orchestration failure."""
+    if run_dir is None:
+        run_dir_label = "N/A"
+    else:
+        run_dir_label = str(run_dir)
+
+    message_lines = [
+        f"Requested platforms: `{','.join(requested_platforms) or 'unknown'}`",
+        f"Run folder: `{run_dir_label}`",
+    ]
+    if failed_platform:
+        message_lines.append(f"Failed platform: `{failed_platform}`")
+    if post_type:
+        message_lines.append(f"Post type: `{post_type}`")
+    message_lines.append(f"Error: {error.strip() or 'unknown error'}")
+    send_slack_alert(title="Copierbot publish failed", message="\n".join(message_lines))
 
 
 def _latest_run_dir(output_dir: Path = OUTPUT_DIR) -> Path:
@@ -59,6 +90,15 @@ def _pick_single_file(run_dir: Path, pattern: str) -> Path | None:
 def _pick_image_file(run_dir: Path) -> Path | None:
     """Return image artifact from run folder, preferring jpg/jpeg over png."""
     for pattern in ("image  *.jpg", "image  *.jpeg", "image  *.png"):
+        path = _pick_single_file(run_dir, pattern)
+        if path is not None:
+            return path
+    return None
+
+
+def _pick_system_log_card_file(run_dir: Path) -> Path | None:
+    """Return rendered system-log card from run folder when present."""
+    for pattern in ("system_log_card  *.png", "system_log_card  *.jpg", "system_log_card  *.jpeg"):
         path = _pick_single_file(run_dir, pattern)
         if path is not None:
             return path
@@ -125,6 +165,30 @@ def _first_nonempty_line(text: str) -> str:
     return ""
 
 
+def _pick_instagram_media_file(run_dir: Path, post_type: str) -> Path:
+    """Return the media file to host for Instagram publishing."""
+    if post_type == "system_log":
+        existing_card = _pick_system_log_card_file(run_dir)
+        if existing_card is not None:
+            return existing_card
+
+        system_log_path = _pick_single_file(run_dir, "system_log  *.txt")
+        if system_log_path is None:
+            raise RuntimeError("System log post selected but no system_log file found.")
+
+        output_path = card_path_for_system_log(system_log_path)
+        render_system_log_card(
+            system_log_text=_read_text_file(system_log_path),
+            output_path=output_path,
+        )
+        return output_path
+
+    image_path = _pick_image_file(run_dir)
+    if image_path is None:
+        raise RuntimeError("Instagram publish requires an image file for news posts.")
+    return image_path
+
+
 def _safe_title_for_wordpress(title: str) -> str:
     """Normalize title for WordPress posts."""
     value = " ".join((title or "").replace("\r", " ").replace("\n", " ").split())
@@ -142,7 +206,7 @@ def _wordpress_date_fields_from_run_dir(run_dir: Path) -> tuple[str, str] | None
         naive_local = datetime.strptime(timestamp, "%Y-%m-%d-%H-%M-%S")
     except ValueError:
         return None
-    local_tz = datetime.now().astimezone().tzinfo
+    local_tz = _resolve_wordpress_publish_timezone()
     if local_tz is None:
         return None
     local_dt = naive_local.replace(tzinfo=local_tz)
@@ -151,6 +215,37 @@ def _wordpress_date_fields_from_run_dir(run_dir: Path) -> tuple[str, str] | None
         local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         gmt_dt.strftime("%Y-%m-%dT%H:%M:%S"),
     )
+
+
+def _resolve_wordpress_publish_timezone():
+    """Return the timezone used to interpret run folder timestamps for WordPress."""
+    configured_name = os.getenv("WORDPRESS_SITE_TIMEZONE", "").strip()
+    timezone_name = configured_name or _detect_system_timezone_name()
+    if timezone_name:
+        try:
+            return ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            logging.warning(
+                "Ignoring invalid WORDPRESS_SITE_TIMEZONE=%r; falling back to system offset.",
+                timezone_name,
+            )
+
+    return datetime.now().astimezone().tzinfo
+
+
+def _detect_system_timezone_name() -> str:
+    """Best-effort lookup of the host IANA timezone name."""
+    try:
+        target = Path("/etc/localtime").resolve()
+    except OSError:
+        return ""
+
+    marker = "zoneinfo/"
+    resolved = str(target)
+    index = resolved.find(marker)
+    if index == -1:
+        return ""
+    return resolved[index + len(marker) :].strip()
 
 
 def _detect_post_type(run_dir: Path) -> str:
@@ -526,6 +621,123 @@ def _publish_run_directory_wordpress(run_dir: Path, adapter: WordpressAdapter) -
         raise
 
 
+def _publish_run_directory_instagram(
+    run_dir: Path,
+    adapter: InstagramAdapter,
+    wordpress_host_adapter: WordpressAdapter,
+    *,
+    delete_hosted_media_after_publish: bool = False,
+) -> dict:
+    """Publish one run directory to Instagram using WordPress media as public hosting."""
+    init_storage()
+    run_dir = run_dir.resolve()
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run directory does not exist: {run_dir}")
+
+    post_type = _detect_post_type(run_dir)
+    idempotency_key = f"publish:instagram:{run_dir.name}"
+    existing_job = find_post_job_by_idempotency_key(idempotency_key)
+    if existing_job and existing_job.get("status") == "published":
+        return {
+            "job_id": int(existing_job["id"]),
+            "status": "already_published",
+            "post_type": post_type,
+            "run_dir": str(run_dir),
+            "platform": "instagram",
+        }
+
+    if existing_job:
+        job_id = int(existing_job["id"])
+    else:
+        job_id = create_post_job(
+            post_type=post_type,
+            status="generated",
+            idempotency_key=idempotency_key,
+        )
+
+    update_post_job_status(job_id, status="publishing", error="")
+    hosted_media_id = 0
+
+    try:
+        if post_type == "system_log":
+            system_log_path = _pick_single_file(run_dir, "system_log  *.txt")
+            if system_log_path is None:
+                raise RuntimeError("System log post selected but no system_log file found.")
+            caption_text = _read_text_file(system_log_path)
+            publish_text = append_ai_disclosure(caption_text)
+            media_path = _pick_instagram_media_file(run_dir, post_type)
+            hosted_media_id, hosted_image_url = wordpress_host_adapter.upload_media_public_url(media_path)
+            post_result = adapter.publish_image(
+                image_url=hosted_image_url,
+                caption=publish_text,
+            )
+            upsert_post_artifacts(
+                job_id=job_id,
+                caption=caption_text,
+                system_log_path=str(system_log_path),
+                image_path=str(media_path),
+            )
+        else:
+            caption_path = _pick_single_file(run_dir, "caption  *.txt")
+            prompt_path = _pick_single_file(run_dir, "prompt  *.txt")
+            if caption_path is None:
+                raise RuntimeError("News post selected but no caption file found.")
+
+            caption_text = _read_text_file(caption_path)
+            prompt_text = _read_text_file(prompt_path) if prompt_path else ""
+            generated_title = _extract_title_from_prompt(prompt_text)
+            caption_body = _strip_title_from_caption(caption_text, generated_title)
+            if not caption_body:
+                caption_body = caption_text.strip()
+            publish_text = append_ai_disclosure(caption_body)
+            media_path = _pick_instagram_media_file(run_dir, post_type)
+            hosted_media_id, hosted_image_url = wordpress_host_adapter.upload_media_public_url(media_path)
+            post_result = adapter.publish_image(
+                image_url=hosted_image_url,
+                caption=publish_text,
+            )
+            upsert_post_artifacts(
+                job_id=job_id,
+                caption=caption_text,
+                prompt=prompt_text,
+                image_path=str(media_path),
+            )
+
+        remote_post_id = str(post_result.get("id", "")).strip()
+        remote_url = str(post_result.get("permalink", "")).strip()
+        if not remote_post_id:
+            raise RuntimeError("Instagram publish succeeded but returned no media id.")
+        record_published_post(
+            job_id=job_id,
+            platform="instagram",
+            remote_post_id=remote_post_id,
+            remote_url=remote_url,
+        )
+        update_post_job_status(job_id, status="published", error="")
+        return {
+            "job_id": job_id,
+            "status": "published",
+            "post_type": post_type,
+            "run_dir": str(run_dir),
+            "remote_post_id": remote_post_id,
+            "remote_url": remote_url,
+            "platform": "instagram",
+        }
+    except (RuntimeError, InstagramAPIError, WordpressAPIError, FileNotFoundError) as exc:
+        update_post_job_status(job_id, status="failed", error=str(exc))
+        raise
+    finally:
+        if delete_hosted_media_after_publish and hosted_media_id > 0:
+            try:
+                wordpress_host_adapter.delete_media(hosted_media_id)
+            except Exception as cleanup_exc:
+                logging.warning(
+                    "Failed to delete temporary WordPress media %s after Instagram publish: %s",
+                    hosted_media_id,
+                    cleanup_exc,
+                )
+
+
 def publish_run_directory(
     run_dir: Path,
     *,
@@ -533,6 +745,8 @@ def publish_run_directory(
     mastodon_adapter: MastodonAdapter | None = None,
     bluesky_adapter: BlueskyAdapter | None = None,
     wordpress_adapter: WordpressAdapter | None = None,
+    instagram_adapter: InstagramAdapter | None = None,
+    delete_instagram_hosted_media_after_publish: bool = False,
     visibility: str = "",
 ) -> dict:
     """Publish one run directory to selected platform."""
@@ -553,6 +767,17 @@ def publish_run_directory(
         if wordpress_adapter is None:
             raise ValueError("wordpress_adapter is required for platform='wordpress'.")
         return _publish_run_directory_wordpress(run_dir=run_dir, adapter=wordpress_adapter)
+    if selected == "instagram":
+        if instagram_adapter is None:
+            raise ValueError("instagram_adapter is required for platform='instagram'.")
+        if wordpress_adapter is None:
+            raise ValueError("wordpress_adapter is required for platform='instagram'.")
+        return _publish_run_directory_instagram(
+            run_dir=run_dir,
+            adapter=instagram_adapter,
+            wordpress_host_adapter=wordpress_adapter,
+            delete_hosted_media_after_publish=delete_instagram_hosted_media_after_publish,
+        )
     raise ValueError("Unsupported platform.")
 
 
@@ -569,8 +794,8 @@ def main() -> int:
         "--platform",
         default="mastodon",
         help=(
-            "Publishing destination platform(s): mastodon, bluesky, wordpress, all, "
-            "or comma-separated subset (e.g. bluesky,wordpress)."
+            "Publishing destination platform(s): mastodon, bluesky, wordpress, instagram, "
+            "all, or comma-separated subset (e.g. bluesky,wordpress)."
         ),
     )
     parser.add_argument(
@@ -580,56 +805,137 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    run_dir = Path(args.run_dir).resolve() if args.run_dir else _latest_run_dir()
-    targets = _parse_platform_targets(args.platform)
+    run_dir: Path | None = None
+    targets: list[str] = []
+    current_target = ""
 
-    mastodon_adapter: MastodonAdapter | None = None
-    bluesky_adapter: BlueskyAdapter | None = None
-    wordpress_adapter: WordpressAdapter | None = None
+    try:
+        run_dir = Path(args.run_dir).resolve() if args.run_dir else _latest_run_dir()
+        targets = _parse_platform_targets(args.platform)
 
-    if "mastodon" in targets:
-        mastodon_config = load_mastodon_config(required=True)
-        assert mastodon_config is not None
-        mastodon_adapter = MastodonAdapter(mastodon_config)
-        mastodon_account = mastodon_adapter.verify_account()
-        logging.info("Mastodon account verified: @%s", mastodon_account.get("acct", "unknown"))
+        mastodon_adapter: MastodonAdapter | None = None
+        bluesky_adapter: BlueskyAdapter | None = None
+        wordpress_adapter: WordpressAdapter | None = None
+        instagram_adapter: InstagramAdapter | None = None
 
-    if "bluesky" in targets:
-        bluesky_config = load_bluesky_config(required=True)
-        assert bluesky_config is not None
-        bluesky_adapter = BlueskyAdapter(bluesky_config)
-        bluesky_account = bluesky_adapter.verify_account()
-        logging.info("Bluesky account verified: @%s", bluesky_account.get("handle", "unknown"))
+        platform_failures: list[tuple[str, str]] = []
 
-    if "wordpress" in targets:
-        wordpress_config = load_wordpress_config(required=True)
-        assert wordpress_config is not None
-        wordpress_adapter = WordpressAdapter(wordpress_config)
-        wordpress_target = wordpress_adapter.verify_account()
-        logging.info(
-            "WordPress account verified: user=%s site=%s",
-            wordpress_target.get("slug", "unknown"),
-            wordpress_config.base_url,
-        )
+        for target in targets:
+            current_target = target
+            try:
+                if target == "mastodon" and mastodon_adapter is None:
+                    mastodon_config = load_mastodon_config(required=True)
+                    assert mastodon_config is not None
+                    mastodon_adapter = MastodonAdapter(mastodon_config)
+                    mastodon_account = mastodon_adapter.verify_account()
+                    logging.info(
+                        "Mastodon account verified: @%s",
+                        mastodon_account.get("acct", "unknown"),
+                    )
 
-    for target in targets:
-        result = publish_run_directory(
+                if target == "bluesky" and bluesky_adapter is None:
+                    bluesky_config = load_bluesky_config(required=True)
+                    assert bluesky_config is not None
+                    bluesky_adapter = BlueskyAdapter(bluesky_config)
+                    bluesky_account = bluesky_adapter.verify_account()
+                    logging.info(
+                        "Bluesky account verified: @%s",
+                        bluesky_account.get("handle", "unknown"),
+                    )
+
+                if target == "wordpress" and wordpress_adapter is None:
+                    wordpress_config = load_wordpress_config(required=True)
+                    assert wordpress_config is not None
+                    wordpress_adapter = WordpressAdapter(wordpress_config)
+                    wordpress_target = wordpress_adapter.verify_account()
+                    logging.info(
+                        "WordPress account verified: user=%s site=%s",
+                        wordpress_target.get("slug", "unknown"),
+                        wordpress_config.base_url,
+                    )
+
+                if target == "instagram":
+                    if instagram_adapter is None:
+                        instagram_config = load_instagram_config(required=True)
+                        assert instagram_config is not None
+                        instagram_adapter = InstagramAdapter(instagram_config)
+                        instagram_account = instagram_adapter.verify_account()
+                        logging.info(
+                            "Instagram account verified: @%s",
+                            instagram_account.get("username", "unknown"),
+                        )
+                    if wordpress_adapter is None:
+                        wordpress_config = load_wordpress_config(required=True)
+                        assert wordpress_config is not None
+                        wordpress_adapter = WordpressAdapter(wordpress_config)
+                        wordpress_target = wordpress_adapter.verify_account()
+                        logging.info(
+                            "WordPress media host verified for Instagram: user=%s site=%s",
+                            wordpress_target.get("slug", "unknown"),
+                            wordpress_config.base_url,
+                        )
+
+                result = publish_run_directory(
+                    run_dir=run_dir,
+                    platform=target,
+                    mastodon_adapter=mastodon_adapter,
+                    bluesky_adapter=bluesky_adapter,
+                    wordpress_adapter=wordpress_adapter,
+                    instagram_adapter=instagram_adapter,
+                    delete_instagram_hosted_media_after_publish=(
+                        target == "instagram" and "wordpress" not in targets
+                    ),
+                    visibility=args.visibility,
+                )
+                logging.info(
+                    "Publish result: platform=%s status=%s post_type=%s run_dir=%s remote_url=%s",
+                    target,
+                    result.get("status"),
+                    result.get("post_type"),
+                    result.get("run_dir"),
+                    result.get("remote_url", ""),
+                )
+            except (
+                ValueError,
+                RuntimeError,
+                FileNotFoundError,
+                MastodonAPIError,
+                BlueskyAPIError,
+                WordpressAPIError,
+                InstagramAPIError,
+            ) as exc:
+                platform_failures.append((target, str(exc)))
+                logging.error(
+                    "Publish failed for platform=%s run_dir=%s: %s",
+                    target,
+                    run_dir,
+                    exc,
+                )
+                continue
+
+        if platform_failures:
+            current_target = ",".join(platform for platform, _ in platform_failures)
+            raise RuntimeError(
+                "; ".join(
+                    f"{platform}: {error}" for platform, error in platform_failures
+                )
+            )
+        return 0
+    except Exception as exc:
+        post_type = ""
+        if run_dir is not None and run_dir.exists():
+            try:
+                post_type = _detect_post_type(run_dir)
+            except Exception:
+                post_type = ""
+        _send_publish_failure_alert(
             run_dir=run_dir,
-            platform=target,
-            mastodon_adapter=mastodon_adapter,
-            bluesky_adapter=bluesky_adapter,
-            wordpress_adapter=wordpress_adapter,
-            visibility=args.visibility,
+            requested_platforms=targets,
+            failed_platform=current_target,
+            post_type=post_type,
+            error=str(exc),
         )
-        logging.info(
-            "Publish result: platform=%s status=%s post_type=%s run_dir=%s remote_url=%s",
-            target,
-            result.get("status"),
-            result.get("post_type"),
-            result.get("run_dir"),
-            result.get("remote_url", ""),
-        )
-    return 0
+        raise
 
 
 if __name__ == "__main__":

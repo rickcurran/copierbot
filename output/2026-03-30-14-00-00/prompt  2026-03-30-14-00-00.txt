@@ -1,0 +1,14 @@
+Title: Silent Flames Beneath Industrial Dreams
+Original headline: Chevron Says Damage to Wheatstone Gas Facility to Affect Restart - Bloomberg.com
+Article URL: https://www.bloomberg.com/news/articles/2026-03-29/chevron-says-damage-to-wheatstone-gas-facility-to-affect-restart
+Headline used for generation: Chevron Says Damage to Wheatstone Gas Facility to Affect Restart - Bloomberg.com
+
+Story context used: Chevron Says Damage to Wheatstone Gas Facility to Affect Restart - Bloomberg.com | Storm damage to Chevron Corp.’s Wheatstone gas plant in Australia is hampering efforts to restart operations and the facility won’t be back online fully for weeks, adding further strain to the global LNG market.
+Source metadata excerpt: N/A
+Visual cues used: URL motifs: news, articles, chevron, says, damage, wheatstone, facility, affect
+
+Image render mode: openai_image
+Image error context: N/A
+
+Final image prompt:
+Create a high-surreal torn paper collage of a gloomy industrial landscape represented by photocopied textures of a cracked refinery torn at edges, layered over a skewed twilight sky made from halftone newspaper dots and fine grid overlays. Introduce an impossibly levitating robot constructed from creased blueprint sheets, glossy catalog photos, and old computer chip remnants, its arms replaced by oversized paper-wrenches built from mixed Sudoku and crossword puzzle clippings. Scattered coil springs and broken scanner glass fragments appear as collage seams and glue smears throughout. A translucent ledger page drifts mid-scene, printed on tracing paper with faded ledger lines, symbolizing untraceable corporate damage. Paper office tapes loop erratically in the background like neural networks. Emphasize photocopy noise, rough torn edges, uneven layering, and fingerprint smears to mimic machine malfunction and decay. Atmosphere carries an ironic editorial tone on industrial fragility, global market strain, and broken technology bridging decoding and chaos.. Style: surreal torn-paper photoshop collage, mixed-media photomontage, rough ripped edges, visible glue seams, cut-out magazine fragments, halftone print texture, photocopy grain, avant-garde surrealist composition, visionary dreamscape atmosphere, uncanny symbolic juxtapositions, impossible perspective and scale, satirical editorial social commentary, robots and office machines, occasional gaming and sci-fi references, non-literal storytelling. Safety constraints: Use only fictional characters and original robot archetypes. Do not depict real people, celebrities, politicians, public figures, or recognizable individuals. Do not reference trademarked characters, franchise names, brand names, or logos. No readable text, letters, words, captions, titles, or watermarks inside the image. Keep content non-violent and editorially satirical..

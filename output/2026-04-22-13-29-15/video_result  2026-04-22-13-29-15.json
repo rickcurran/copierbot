@@ -1,0 +1,19 @@
+{
+  "queued": {
+    "status": "queued",
+    "request_id": "291c094c-a729-418a-bce3-26c7b7a0d2c8",
+    "status_url": "https://platform.higgsfield.ai/requests/291c094c-a729-418a-bce3-26c7b7a0d2c8/status",
+    "cancel_url": "https://platform.higgsfield.ai/requests/291c094c-a729-418a-bce3-26c7b7a0d2c8/cancel"
+  },
+  "failed": {
+    "error": "Higgsfield video generation ended with status 'failed'.",
+    "step": "polling",
+    "status": {
+      "status": "failed",
+      "error": "Generation timed out",
+      "request_id": "291c094c-a729-418a-bce3-26c7b7a0d2c8",
+      "status_url": "https://platform.higgsfield.ai/requests/291c094c-a729-418a-bce3-26c7b7a0d2c8/status",
+      "cancel_url": "https://platform.higgsfield.ai/requests/291c094c-a729-418a-bce3-26c7b7a0d2c8/cancel"
+    }
+  }
+}

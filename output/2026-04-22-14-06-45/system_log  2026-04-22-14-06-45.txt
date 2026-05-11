@@ -1,0 +1,4 @@
+SYSTEM LOG
+Toner Level: 74% full, Tray: overloaded
+Jam Detection: slight jam in tray 2
+Firmware Status: stuck in beta loop Output: scarce Philosophy: Docs flee, toner haunts. Tip: Pull 3 sheets, reboot hopes, rinse & repeat.

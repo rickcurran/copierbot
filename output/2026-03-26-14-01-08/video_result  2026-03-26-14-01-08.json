@@ -1,0 +1,17 @@
+{
+  "queued": {
+    "status": "queued",
+    "request_id": "f7978b5c-ce08-4a2f-8fc2-ec3a8bbe6bc1",
+    "status_url": "https://platform.higgsfield.ai/requests/f7978b5c-ce08-4a2f-8fc2-ec3a8bbe6bc1/status",
+    "cancel_url": "https://platform.higgsfield.ai/requests/f7978b5c-ce08-4a2f-8fc2-ec3a8bbe6bc1/cancel"
+  },
+  "completed": {
+    "status": "completed",
+    "request_id": "f7978b5c-ce08-4a2f-8fc2-ec3a8bbe6bc1",
+    "status_url": "https://platform.higgsfield.ai/requests/f7978b5c-ce08-4a2f-8fc2-ec3a8bbe6bc1/status",
+    "cancel_url": "https://platform.higgsfield.ai/requests/f7978b5c-ce08-4a2f-8fc2-ec3a8bbe6bc1/cancel",
+    "video": {
+      "url": "https://cloud-cdn.higgsfield.ai/769be6e7-d3f0-4a31-b3a8-e0b930dd7197/2143e724-4521-42b0-a250-57afcd4467d4.mp4"
+    }
+  }
+}

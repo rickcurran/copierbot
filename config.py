@@ -15,7 +15,7 @@ class Settings:
     news_country: str = "us"
     news_page_size: int = 40
     text_model: str = "gpt-4.1-mini"
-    image_model: str = "gpt-image-1"
+    image_model: str = "gpt-image-2"
     post_mode: str = "default"
     mastodon_max_chars: int = 300
     bluesky_max_chars: int = 300
@@ -54,6 +54,7 @@ def get_settings(
 
     news_country = os.getenv("NEWS_COUNTRY", "us").strip().lower() or "us"
     news_page_size_raw = os.getenv("NEWS_PAGE_SIZE", "40").strip()
+    image_model = os.getenv("IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
     try:
         news_page_size = int(news_page_size_raw)
     except ValueError:
@@ -83,6 +84,7 @@ def get_settings(
         news_api_key=news_api_key,
         news_country=news_country,
         news_page_size=max(10, min(news_page_size, 100)),
+        image_model=image_model,
         post_mode=post_mode,
         mastodon_max_chars=mastodon_max_chars,
         bluesky_max_chars=bluesky_max_chars,

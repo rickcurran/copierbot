@@ -194,6 +194,13 @@ class MastodonAdapter:
             idempotency_key=idempotency_key,
         )
 
+    def get_status(self, status_id: str) -> dict:
+        """Fetch one Mastodon status by id."""
+        payload = self._request("GET", f"/api/v1/statuses/{status_id}")
+        if not isinstance(payload, dict):
+            raise MastodonAPIError("Unexpected status payload type.")
+        return payload
+
     def fetch_notifications(
         self,
         *,

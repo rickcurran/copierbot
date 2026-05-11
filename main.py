@@ -10,7 +10,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from article_context import build_article_context
+from article_context import build_article_context, fetch_article_seed
 from alerts import classify_openai_error_text, send_slack_alert
 from ascii_fallback import create_ascii_fallback_image
 from anonymize import anonymize_headline_names
@@ -81,26 +81,21 @@ def choose_post_type() -> str:
     return "system_log" if random.random() < 0.2 else "news"
 
 
-def run_news_post(
+def _generate_news_post_from_article(
     client: OpenAI,
     settings,
     persona_context: str,
     image_path: Path,
     prompt_path: Path,
     caption_path: Path,
+    *,
+    headline: str,
+    description: str,
+    article_url: str,
+    article_html: str = "",
 ) -> None:
-    """Generate a standard news collage post."""
+    """Generate a standard news collage post from one resolved article."""
     max_post_chars = get_generation_char_limit(settings)
-    logging.info("Fetching current headlines...")
-    headlines = get_headlines(
-        news_api_key=settings.news_api_key,
-        country=settings.news_country,
-        page_size=settings.news_page_size,
-    )
-
-    selected_article = choose_headline(headlines)
-    headline = selected_article["title"]
-    article_url = selected_article["url"]
     logging.info("Selected headline: %s", headline)
     if article_url:
         logging.info("Selected article URL: %s", article_url)
@@ -115,8 +110,9 @@ def run_news_post(
 
     article_context = build_article_context(
         headline=safe_headline,
-        description=selected_article.get("description", ""),
+        description=description,
         article_url=article_url,
+        article_html=article_html,
     )
     story_context = article_context["story_context"]
     visual_cues = article_context["visual_cues"]
@@ -202,6 +198,64 @@ def run_news_post(
     logging.info("Saved final prompt to %s", prompt_path)
 
 
+def run_news_post(
+    client: OpenAI,
+    settings,
+    persona_context: str,
+    image_path: Path,
+    prompt_path: Path,
+    caption_path: Path,
+) -> None:
+    """Generate a standard news collage post."""
+    logging.info("Fetching current headlines...")
+    headlines = get_headlines(
+        news_api_key=settings.news_api_key,
+        country=settings.news_country,
+        page_size=settings.news_page_size,
+    )
+
+    selected_article = choose_headline(headlines)
+    _generate_news_post_from_article(
+        client=client,
+        settings=settings,
+        persona_context=persona_context,
+        image_path=image_path,
+        prompt_path=prompt_path,
+        caption_path=caption_path,
+        headline=selected_article["title"],
+        description=selected_article.get("description", ""),
+        article_url=selected_article["url"],
+    )
+
+
+def run_manual_url_post(
+    client: OpenAI,
+    settings,
+    persona_context: str,
+    image_path: Path,
+    prompt_path: Path,
+    caption_path: Path,
+    *,
+    article_url: str,
+) -> None:
+    """Generate a news-style post from one explicitly supplied article URL."""
+    resolved = fetch_article_seed(article_url)
+    logging.info("Manual article URL mode active.")
+    logging.info("Resolved manual source headline: %s", resolved["headline"])
+    _generate_news_post_from_article(
+        client=client,
+        settings=settings,
+        persona_context=persona_context,
+        image_path=image_path,
+        prompt_path=prompt_path,
+        caption_path=caption_path,
+        headline=resolved["headline"],
+        description=resolved["description"],
+        article_url=article_url,
+        article_html=resolved["article_html"],
+    )
+
+
 def run_system_log_post(client: OpenAI, settings, persona_context: str, system_log_path: Path) -> None:
     """Generate a system-log-only post."""
     logging.info("Generating system log post...")
@@ -237,7 +291,7 @@ def _write_run_manifest(path: Path, run_dirs: list[Path]) -> None:
     path.write_text((payload + "\n") if payload else "", encoding="utf-8")
 
 
-def run(run_manifest_path: Path | None = None) -> None:
+def run(run_manifest_path: Path | None = None, article_url: str = "") -> None:
     """Execute the full Copierbot pipeline."""
     setup_logging()
     settings = get_settings()
@@ -260,8 +314,12 @@ def run(run_manifest_path: Path | None = None) -> None:
             disclosure_overhead_chars(),
         )
 
-        post_type = choose_post_type()
-        logging.info("Selected post type: %s", post_type)
+        if article_url:
+            post_type = "news"
+            logging.info("Selected post type: %s (forced by manual article URL)", post_type)
+        else:
+            post_type = choose_post_type()
+            logging.info("Selected post type: %s", post_type)
         if post_type == "system_log":
             run_system_log_post(
                 client=client,
@@ -270,14 +328,25 @@ def run(run_manifest_path: Path | None = None) -> None:
                 system_log_path=system_log_path,
             )
         else:
-            run_news_post(
-                client=client,
-                settings=settings,
-                persona_context=persona_context,
-                image_path=image_path,
-                prompt_path=prompt_path,
-                caption_path=caption_path,
-            )
+            if article_url:
+                run_manual_url_post(
+                    client=client,
+                    settings=settings,
+                    persona_context=persona_context,
+                    image_path=image_path,
+                    prompt_path=prompt_path,
+                    caption_path=caption_path,
+                    article_url=article_url,
+                )
+            else:
+                run_news_post(
+                    client=client,
+                    settings=settings,
+                    persona_context=persona_context,
+                    image_path=image_path,
+                    prompt_path=prompt_path,
+                    caption_path=caption_path,
+                )
 
         previous_state = get_persona_state()
         new_state = increment_post_counter()
@@ -360,11 +429,16 @@ if __name__ == "__main__":
         default="",
         help="Optional path to write created output run directories (one per line).",
     )
+    parser.add_argument(
+        "--article-url",
+        default="",
+        help="Optional webpage URL to use directly for one news-style generation run.",
+    )
     args = parser.parse_args()
 
     try:
         manifest_path = Path(args.run_manifest).resolve() if args.run_manifest else None
-        run(run_manifest_path=manifest_path)
+        run(run_manifest_path=manifest_path, article_url=str(args.article_url or "").strip())
     except Exception as exc:
         logging.basicConfig(level=logging.ERROR, format="%(levelname)s | %(message)s")
         logging.error("Pipeline failed: %s", exc)

@@ -87,6 +87,12 @@ DEPRIORITY_TERMS = {
     "royal family": 6,
     "gossip": 8,
     "fashion week": 6,
+    "horoscope": 8,
+    "horoscopes": 8,
+    "astrology": 8,
+    "zodiac": 8,
+    "star sign": 8,
+    "star signs": 8,
 }
 
 CELEBRITY_TERMS = {
@@ -251,6 +257,28 @@ SOCCER_TERMS = {
     "mls",
 }
 
+HOROSCOPE_TERMS = {
+    "horoscope",
+    "horoscopes",
+    "astrology",
+    "astrological",
+    "zodiac",
+    "star sign",
+    "star signs",
+    "aries",
+    "taurus",
+    "gemini",
+    "cancer",
+    "leo",
+    "virgo",
+    "libra",
+    "scorpio",
+    "sagittarius",
+    "capricorn",
+    "aquarius",
+    "pisces",
+}
+
 SUPER_BOWL_CULTURAL_TERMS = {
     "halftime",
     "half-time",
@@ -410,6 +438,10 @@ def _is_political_or_immigration_article(title: str, description: str) -> bool:
 def _is_explicitly_blocked_topic(title: str, description: str) -> bool:
     """Return True for explicitly blocked user topics."""
     text = f"{title} {description}".lower()
+
+    has_horoscope = any(re.search(rf"\b{re.escape(term)}\b", text) for term in HOROSCOPE_TERMS)
+    if has_horoscope:
+        return True
 
     has_trump = any(re.search(rf"\b{re.escape(term)}\b", text) for term in TRUMP_TERMS)
     if has_trump:

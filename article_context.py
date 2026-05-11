@@ -18,9 +18,18 @@ class ArticleContext(TypedDict):
     source_meta_excerpt: str
 
 
+class ArticleSeed(TypedDict):
+    """Resolved seed fields for manual article-driven generation."""
+
+    headline: str
+    description: str
+    article_html: str
+
+
 INTERESTING_META_KEYS = {
     "og:title",
     "og:description",
+    "description",
     "twitter:title",
     "twitter:description",
     "twitter:image:alt",
@@ -35,10 +44,15 @@ class _ArticleMetaParser(HTMLParser):
         super().__init__()
         self.meta: dict[str, str] = {}
         self.image_alts: list[str] = []
+        self._inside_title = False
+        self._title_parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
         lowered = tag.lower()
         attr_map = {str(k).lower(): str(v) for k, v in attrs}
+
+        if lowered == "title":
+            self._inside_title = True
 
         if lowered == "meta":
             key = (attr_map.get("property") or attr_map.get("name") or "").lower().strip()
@@ -50,6 +64,19 @@ class _ArticleMetaParser(HTMLParser):
             alt = (attr_map.get("alt") or "").strip()
             if 12 <= len(alt) <= 220 and alt not in self.image_alts:
                 self.image_alts.append(alt)
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if str(tag).lower() == "title":
+            self._inside_title = False
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._inside_title and data:
+            self._title_parts.append(data)
+
+    @property
+    def title_text(self) -> str:
+        """Return parsed page title text."""
+        return _clean_text(" ".join(self._title_parts))
 
 
 def _clean_text(text: str) -> str:
@@ -90,6 +117,31 @@ def _slug_tokens(url: str) -> list[str]:
     return deduped[:8]
 
 
+def _fallback_headline_from_url(article_url: str) -> str:
+    """Build a readable fallback headline from URL components."""
+    try:
+        parsed = urlparse(article_url)
+    except ValueError:
+        return "Manual source"
+
+    tokens = _slug_tokens(article_url)
+    if tokens:
+        humanized = " ".join(token.capitalize() for token in tokens[:8])
+        return humanized[:160].strip() or "Manual source"
+
+    host = (parsed.netloc or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return f"Manual source from {host}"[:160].strip() or "Manual source"
+
+
+def _parse_article_html(html: str) -> _ArticleMetaParser:
+    """Parse article HTML into reusable metadata fields."""
+    parser = _ArticleMetaParser()
+    parser.feed(html or "")
+    return parser
+
+
 def _fetch_article_html(article_url: str, timeout: int = 20) -> str:
     """Fetch article HTML safely with a browser-like user agent."""
     headers = {
@@ -104,7 +156,49 @@ def _fetch_article_html(article_url: str, timeout: int = 20) -> str:
     return response.text
 
 
-def build_article_context(headline: str, description: str, article_url: str) -> ArticleContext:
+def fetch_article_seed(article_url: str) -> ArticleSeed:
+    """Resolve headline and description from a manual article URL."""
+    article_url = (article_url or "").strip()
+    if not article_url:
+        return {"headline": "Manual source", "description": "", "article_html": ""}
+
+    try:
+        html = _fetch_article_html(article_url)
+    except requests.RequestException:
+        return {
+            "headline": _fallback_headline_from_url(article_url),
+            "description": "",
+            "article_html": "",
+        }
+
+    parser = _parse_article_html(html)
+    headline_candidates = [
+        _clean_text(parser.meta.get("og:title", "")),
+        _clean_text(parser.meta.get("twitter:title", "")),
+        parser.title_text,
+    ]
+    description_candidates = [
+        _clean_text(parser.meta.get("og:description", "")),
+        _clean_text(parser.meta.get("twitter:description", "")),
+        _clean_text(parser.meta.get("description", "")),
+    ]
+    headline = next((item for item in headline_candidates if item), "")
+    description = next((item for item in description_candidates if item), "")
+    if not headline:
+        headline = _fallback_headline_from_url(article_url)
+    return {
+        "headline": headline[:220].strip(),
+        "description": description[:400].strip(),
+        "article_html": html,
+    }
+
+
+def build_article_context(
+    headline: str,
+    description: str,
+    article_url: str,
+    article_html: str = "",
+) -> ArticleContext:
     """Build story + visual context from headline, description, and article metadata."""
     cleaned_headline = _clean_text(headline)
     cleaned_description = _clean_text(description)
@@ -118,14 +212,21 @@ def build_article_context(headline: str, description: str, article_url: str) -> 
 
     if article_url:
         try:
-            html = _fetch_article_html(article_url)
-            parser = _ArticleMetaParser()
-            parser.feed(html)
+            html = article_html or _fetch_article_html(article_url)
+            parser = _parse_article_html(html)
 
-            for key in ("og:title", "twitter:title", "og:description", "twitter:description"):
+            for key in (
+                "og:title",
+                "twitter:title",
+                "og:description",
+                "twitter:description",
+                "description",
+            ):
                 value = _clean_text(parser.meta.get(key, ""))
                 if value and value not in source_meta_excerpt_parts:
                     source_meta_excerpt_parts.append(value)
+            if parser.title_text and parser.title_text not in source_meta_excerpt_parts:
+                source_meta_excerpt_parts.append(parser.title_text)
 
             for key in ("og:image:alt", "twitter:image:alt"):
                 value = _clean_text(parser.meta.get(key, ""))

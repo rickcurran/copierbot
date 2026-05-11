@@ -1,0 +1,8 @@
+SYSTEM LOG  
+Toner at 44%  
+Paper tray aligned  
+Jam warning flickers  
+Firmware loops in beta  
+Human work steady  
+Existence notes: repetition rules  
+Advice: Keep error cycling to mimic output.

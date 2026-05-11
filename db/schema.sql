@@ -66,6 +66,23 @@ CREATE TABLE IF NOT EXISTS replies (
     FOREIGN KEY (mention_row_id) REFERENCES mentions(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS quote_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quote_id TEXT NOT NULL DEFAULT '',
+    mention_row_id INTEGER NOT NULL,
+    reply_row_id INTEGER NOT NULL DEFAULT 0,
+    platform TEXT NOT NULL DEFAULT '',
+    mention_id TEXT NOT NULL DEFAULT '',
+    source_title TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    theme TEXT NOT NULL DEFAULT '',
+    reply_intent TEXT NOT NULL DEFAULT '',
+    variant_key TEXT NOT NULL DEFAULT '',
+    reply_text TEXT NOT NULL DEFAULT '',
+    used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (mention_row_id) REFERENCES mentions(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS memory_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type TEXT NOT NULL,
@@ -98,6 +115,12 @@ ON mentions(handled, inserted_at);
 
 CREATE INDEX IF NOT EXISTS idx_replies_mention_row_id
 ON replies(mention_row_id);
+
+CREATE INDEX IF NOT EXISTS idx_quote_usage_quote_id_used_at
+ON quote_usage(quote_id, used_at);
+
+CREATE INDEX IF NOT EXISTS idx_quote_usage_source_title_used_at
+ON quote_usage(source_title, used_at);
 
 CREATE TRIGGER IF NOT EXISTS trg_post_jobs_updated_at
 AFTER UPDATE ON post_jobs

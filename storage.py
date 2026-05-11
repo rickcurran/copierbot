@@ -333,6 +333,92 @@ def update_reply_record(
         )
 
 
+def list_reply_remote_ids_for_platform(
+    platform: str,
+    remote_ids: Sequence[str],
+    db_path: Path | None = None,
+) -> set[str]:
+    """Return which remote reply ids already belong to Copierbot for one platform."""
+    _ensure_storage(db_path)
+    candidates = [str(item).strip() for item in remote_ids if str(item).strip()]
+    if not candidates:
+        return set()
+
+    placeholders = ", ".join("?" for _ in candidates)
+    query = (
+        "SELECT remote_reply_id FROM replies "
+        "WHERE platform = ? AND status = 'sent' AND remote_reply_id IN "
+        f"({placeholders})"
+    )
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, (platform, *candidates)).fetchall()
+    return {str(row["remote_reply_id"]).strip() for row in rows if row["remote_reply_id"]}
+
+
+def record_quote_usage(
+    *,
+    quote_id: str,
+    mention_row_id: int,
+    reply_row_id: int,
+    platform: str,
+    mention_id: str,
+    source_title: str,
+    category: str,
+    theme: str,
+    reply_intent: str,
+    variant_key: str,
+    reply_text: str,
+    db_path: Path | None = None,
+) -> int:
+    """Append one quote-usage record and return its row id."""
+    _ensure_storage(db_path)
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO quote_usage
+                (quote_id, mention_row_id, reply_row_id, platform, mention_id,
+                 source_title, category, theme, reply_intent, variant_key, reply_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                quote_id,
+                mention_row_id,
+                reply_row_id,
+                platform,
+                mention_id,
+                source_title,
+                category,
+                theme,
+                reply_intent,
+                variant_key,
+                reply_text,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_recent_quote_usage(
+    *,
+    limit: int = 500,
+    since_hours: int | None = None,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Return recent quote-usage rows, newest first."""
+    _ensure_storage(db_path)
+    limit = max(1, min(limit, 5000))
+    params: list[Any] = []
+    query = "SELECT * FROM quote_usage"
+    if since_hours is not None:
+        hours = max(1, int(since_hours))
+        query += " WHERE used_at >= datetime('now', ?)"
+        params.append(f"-{hours} hours")
+    query += " ORDER BY used_at DESC LIMIT ?"
+    params.append(limit)
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
 def add_memory_event(
     event_type: str,
     summary: str,

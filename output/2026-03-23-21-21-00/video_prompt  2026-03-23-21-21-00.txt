@@ -1,0 +1,21 @@
+Animate from the provided reference image. Preserve the exact composition, color palette, collage materials, and character/object identities from the still image.
+
+Video direction:
+- Style: surreal torn-paper photoshop collage, mixed-media photomontage, cut-out magazine aesthetic, halftone print texture, photocopy grain.
+- Motion: subtle parallax between foreground/midground/background layers; gentle flutter on torn paper edges; drifting toner dust; slight halftone shimmer.
+- Camera: very slow push-in with minimal left-to-right drift.
+- Tempo: dreamlike, uncanny, editorially satirical; avoid chaotic movement.
+- Duration: exactly 5 seconds.
+- Transition: no hard cuts; smooth continuous motion.
+- End state: settle into a near-loopable final frame.
+
+Constraints:
+- Keep scene readable and coherent.
+- Do not add new characters, logos, brand marks, or any readable text.
+- Do not generate pseudo-text, lettering, numbers, captions, labels, subtitles, signage, UI fragments, watermark-like marks, or typographic shapes.
+- If the source image contains text-like collage fragments, keep them abstract, minimized, and fully illegible rather than inventing or sharpening them.
+- Do not introduce photoreal real people.
+- Keep content non-violent and surreal-symbolic.
+
+Source concept and style anchor:
+Create a torn paper collage scene mixing photoreal office textures and magazine clippings fashioned into a bleak, dreamlike office cathedral illuminated by warped fluorescent tubes formed into infinite Mobius loops. Include a massive surreal xerox machine altar with cracked movie marquee glass glowing fragmented '80M' numbers under heavy photocopy noise and glue marks. Surround it with small humanoid calculator/robot hybrids shredding and feeding torn movie stubs and VHS tape fragments into the copier’s maw, collaged with halftone print and imperfect edges. Feature a gigantic dripping rubber stamp with a CPU chip texture and an embedded severed retro game controller button as a symbolic object of mechanized cultural approval. Introduce translucent scanner tray forms morphing into impossibly large star charts printed with binary obituaries, blending scanned paper layers imperfectly glued with visible seams, ripped paper edges, and collaged scratches giving a satirical editorial tone. The scene should feel visionary, uncanny, paradoxical in scale, heavily textured with torn paper, photocopy grain, glue blotches, and layered magazine clipping fragments.. Style: surreal torn-paper photoshop collage, mixed-media photomontage, rough ripped edges, visible glue seams, cut-out magazine fragments, halftone print texture, photocopy grain, avant-garde surrealist composition, visionary dreamscape atmosphere, uncanny symbolic juxtapositions, impossible perspective and scale, satirical editorial social commentary, robots and office machines, occasional gaming and sci-fi references, non-literal storytelling. Safety constraints: Use only fictional characters and original robot archetypes. Do not depict real people, celebrities, politicians, public figures, or recognizable individuals. Do not reference trademarked characters, franchise names, brand names, or logos. No readable text, letters, words, captions, titles, or watermarks inside the image. Keep content non-violent and editorially satirical..

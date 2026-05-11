@@ -172,6 +172,20 @@ class WordpressAdapter:
             raise WordpressAPIError("Unexpected media upload payload type.")
         return payload
 
+    def upload_media_public_url(self, file_path: Path) -> tuple[int, str]:
+        """Upload media and return the WordPress media id plus public source URL."""
+        payload = self.upload_media(file_path)
+        try:
+            media_id = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            media_id = 0
+        source_url = str(payload.get("source_url") or "").strip()
+        if media_id <= 0 or not source_url:
+            raise WordpressAPIError(
+                "WordPress media upload succeeded but response was missing id or source_url."
+            )
+        return media_id, source_url
+
     def create_post(
         self,
         *,
@@ -186,10 +200,12 @@ class WordpressAdapter:
             "content": content_html,
             "status": self.config.default_post_status,
         }
-        if publish_date:
-            payload["date"] = publish_date
+        # WordPress REST gives `date` precedence over `date_gmt`, so prefer
+        # the GMT field when we have both to avoid DST/site-timezone drift.
         if publish_date_gmt:
             payload["date_gmt"] = publish_date_gmt
+        elif publish_date:
+            payload["date"] = publish_date
 
         result = self._request(
             "POST",
@@ -274,6 +290,14 @@ class WordpressAdapter:
         if not isinstance(payload, dict):
             raise WordpressAPIError("Unexpected comment payload type.")
         return payload
+
+    def delete_media(self, media_id: int, *, force: bool = True) -> None:
+        """Delete one WordPress media item."""
+        self._request(
+            "DELETE",
+            f"/wp-json/wp/v2/media/{int(media_id)}",
+            params={"force": "true" if force else "false"},
+        )
 
     def reply_to_comment(self, *, post_id: int, parent_comment_id: int, text: str) -> dict:
         """Create a threaded reply to a WordPress comment."""

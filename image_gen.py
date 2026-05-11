@@ -11,11 +11,16 @@ from PIL import Image
 
 
 STYLE_INSTRUCTIONS = (
-    "surreal torn-paper photoshop collage, mixed-media photomontage, rough ripped edges, "
-    "visible glue seams, cut-out magazine fragments, halftone print texture, photocopy grain, "
-    "avant-garde surrealist composition, visionary dreamscape atmosphere, uncanny symbolic juxtapositions, "
-    "impossible perspective and scale, satirical editorial social commentary, robots and office machines, "
-    "occasional gaming and sci-fi references, non-literal storytelling"
+    "surreal torn-paper mixed-media photomontage, handmade collage assembled from many mismatched print sources, "
+    "predominantly photorealistic printed clippings of real-looking subjects and textures mixed with a smaller amount of drawn, diagrammatic, or printed fragments, "
+    "rough ripped edges, visible glue seams, taped joins, overlapping paper scraps, cut-out magazine fragments, "
+    "newspaper strips, catalogue clippings, office-document scraps, halftone print texture, photocopy grain, ink bleed, "
+    "misregistered print layers, faded areas beside oversaturated fragments, inconsistent paper stocks and colour palettes, "
+    "clear contrast between source materials rather than one unified colour theme, avoid making all elements uniformly illustrative, painterly, airbrushed, or digitally drawn, "
+    "main subjects should read as torn printed photographs from magazines or newspapers with visible print artefacts rather than fresh illustrations, "
+    "photoreal imagery degraded by print reproduction, halftone dots, offset press texture, cheap paper grain, faded blacks, and uneven colour registration, avant-garde surrealist composition, "
+    "visionary dreamscape atmosphere, uncanny symbolic juxtapositions, impossible perspective and scale, satirical editorial "
+    "social commentary, robots and office machines, occasional gaming and sci-fi references, non-literal storytelling"
 )
 
 SAFETY_GUARDRAILS = (

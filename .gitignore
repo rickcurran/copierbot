@@ -6,3 +6,5 @@ __pycache__/
 *.py[cod]
 logs/
 *.log
+data/bluesky_session.json
+data/slack_control.pid

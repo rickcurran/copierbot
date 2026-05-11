@@ -1,0 +1,5 @@
+SYSTEM LOG
+Toner Level: 45% Tray: void, waiting
+Jam Detection: faint in tray 2’s shadow
+Firmware Status: in beta flux
+Human Productivity: unstable Existence: papers flee, toner fades Hint: feed paper; heed slow code’s whisper.

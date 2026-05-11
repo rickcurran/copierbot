@@ -1,0 +1,14 @@
+Title: Silent Wheels of the Cheese Cartel
+Original headline: News Stolen Guinness Cheese Crime Cargo Theft Crisis
+Article URL: https://www.theguardian.com/uk-news/2026/mar/31/stolen-guinness-cheese-crime-cargo-theft-crisis-mike-dawber|https://www.theguardian.com/uk-news/2026/mar/31/stolen-guinness-cheese-crime-cargo-theft-crisis-mike-dawber
+Headline used for generation: News Stolen Guinness Cheese Crime Cargo Theft Crisis
+
+Story context used: News Stolen Guinness Cheese Crime Cargo Theft Crisis
+Source metadata excerpt: N/A
+Visual cues used: URL motifs: news, stolen, guinness, cheese, crime, cargo, theft, crisis
+
+Image render mode: openai_image
+Image error context: N/A
+
+Final image prompt:
+Create a surreal torn paper collage with photocopier noise and mixed media layers. The dreamlike environment is a fractured industrial warehouse interior with crackled halftone print textures and uneven collage seams. Incorporate oversized, levitating cutouts of an impossible, inverted circular cheese wheel layered with patched glue marks and distressed photocopy grain. The paradoxical visual element is office robot limbs operating simultaneously as conveyor belts and scissors, weaving through chaotic document strands and fragmented ledger pages. Symbolically place a miniature, trembling robotic stool in the foreground, representing powerless observers amidst corporate theft rituals. Use layered fragments of obsolete computer circuit boards cut from vintage gaming manuals to add texture and sci-fi flavor. Include distorted maps of an unrecognizable port city embossed with stamping marks, blending torn cityscape clippings with photocopied barbed wire. The overall tone should be dry, prophetic, and unsettling, with explicit glue scars, ragged edges, torn newsprint bits overlapping at odd angles, and reflective bursts of malfunctioning copiers creating ghost-like, half-visible shapes.. Style: surreal torn-paper photoshop collage, mixed-media photomontage, rough ripped edges, visible glue seams, cut-out magazine fragments, halftone print texture, photocopy grain, avant-garde surrealist composition, visionary dreamscape atmosphere, uncanny symbolic juxtapositions, impossible perspective and scale, satirical editorial social commentary, robots and office machines, occasional gaming and sci-fi references, non-literal storytelling. Safety constraints: Use only fictional characters and original robot archetypes. Do not depict real people, celebrities, politicians, public figures, or recognizable individuals. Do not reference trademarked characters, franchise names, brand names, or logos. No readable text, letters, words, captions, titles, or watermarks inside the image. Keep content non-violent and editorially satirical..

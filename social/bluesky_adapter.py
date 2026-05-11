@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import time
@@ -65,6 +66,7 @@ class BlueskyAdapter:
     MAX_IMAGE_BYTES = 950 * 1024
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
     MAX_REQUEST_RETRIES = 2
+    SESSION_CACHE_PATH = Path("data/bluesky_session.json")
 
     def __init__(self, config: BlueskyConfig) -> None:
         self.config = config
@@ -76,8 +78,139 @@ class BlueskyAdapter:
             }
         )
         self._access_jwt = ""
+        self._refresh_jwt = ""
         self._did = ""
         self._resolved_handle = ""
+
+    def _apply_session_payload(self, payload: dict[str, Any]) -> None:
+        """Apply session payload returned by Bluesky auth endpoints."""
+        access_jwt = str(payload.get("accessJwt", "")).strip()
+        refresh_jwt = str(payload.get("refreshJwt", "")).strip()
+        did = str(payload.get("did", "")).strip()
+        handle = str(payload.get("handle", "")).strip()
+
+        if not access_jwt or not did:
+            raise BlueskyAPIError("Session response missing accessJwt or did.")
+
+        self._access_jwt = access_jwt
+        self._refresh_jwt = refresh_jwt
+        self._did = did
+        self._resolved_handle = handle or self.config.handle
+
+    def _reset_session(self) -> None:
+        """Clear in-memory auth context."""
+        self._access_jwt = ""
+        self._refresh_jwt = ""
+        self._did = ""
+        self._resolved_handle = ""
+
+    def _load_cached_session(self) -> bool:
+        """Load cached Bluesky session tokens from disk when available."""
+        try:
+            raw = json.loads(self.SESSION_CACHE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(raw, dict):
+            return False
+
+        try:
+            self._apply_session_payload(raw)
+        except BlueskyAPIError:
+            self._clear_cached_session()
+            return False
+        return True
+
+    def _save_cached_session(self) -> None:
+        """Persist Bluesky session tokens for reuse across short-lived CLI runs."""
+        payload = {
+            "accessJwt": self._access_jwt,
+            "refreshJwt": self._refresh_jwt,
+            "did": self._did,
+            "handle": self._resolved_handle or self.config.handle,
+            "savedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        try:
+            self.SESSION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.SESSION_CACHE_PATH.write_text(
+                json.dumps(payload, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _clear_cached_session(self) -> None:
+        """Remove cached session tokens after auth failure."""
+        self._reset_session()
+        try:
+            self.SESSION_CACHE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _create_session(self) -> None:
+        """Create a brand new Bluesky session from handle + app password."""
+        payload = self._request(
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            json_body={"identifier": self.config.handle, "password": self.config.app_password},
+            auth=False,
+        )
+        if not isinstance(payload, dict):
+            raise BlueskyAPIError("Unexpected createSession payload type.")
+        self._apply_session_payload(payload)
+        self._save_cached_session()
+
+    def _refresh_session(self) -> None:
+        """Refresh a cached Bluesky session using its refresh token."""
+        if not self._refresh_jwt:
+            raise BlueskyAPIError("No cached Bluesky refresh token is available.")
+        payload = self._request(
+            "POST",
+            "/xrpc/com.atproto.server.refreshSession",
+            extra_headers={"Authorization": f"Bearer {self._refresh_jwt}"},
+            auth=False,
+        )
+        if not isinstance(payload, dict):
+            raise BlueskyAPIError("Unexpected refreshSession payload type.")
+        self._apply_session_payload(payload)
+        self._save_cached_session()
+
+    def _recover_session(self) -> None:
+        """Recover auth after a 401 by refreshing, then falling back to login."""
+        refresh_error: Exception | None = None
+        if self._refresh_jwt:
+            try:
+                self._refresh_session()
+                return
+            except Exception as exc:  # pragma: no cover - defensive fallback path
+                refresh_error = exc
+                self._clear_cached_session()
+        try:
+            self._create_session()
+        except Exception as exc:
+            if refresh_error is not None:
+                raise BlueskyAPIError(
+                    f"Failed to refresh Bluesky session ({refresh_error}) and login again ({exc})."
+                ) from exc
+            raise
+
+    def _is_expired_auth_response(self, response: requests.Response) -> bool:
+        """Return True when Bluesky says the bearer token has expired."""
+        if response.status_code == 401:
+            return True
+        if response.status_code != 400:
+            return False
+
+        message = response.text[:320]
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or payload.get("error") or message)
+        except ValueError:
+            pass
+
+        normalized = message.strip().lower()
+        return "token" in normalized and "expired" in normalized
 
     def _request(
         self,
@@ -99,8 +232,12 @@ class BlueskyAdapter:
         request_timeout = int(timeout_seconds or self.config.timeout_seconds)
         max_attempts = 1 + self.MAX_REQUEST_RETRIES
         last_error: Exception | None = None
+        auth_recovered = False
 
         for attempt in range(max_attempts):
+            request_headers = dict(headers)
+            if auth and self._access_jwt and "Authorization" not in request_headers:
+                request_headers["Authorization"] = f"Bearer {self._access_jwt}"
             try:
                 response = self.session.request(
                     method=method,
@@ -108,7 +245,7 @@ class BlueskyAdapter:
                     params=params,
                     json=json_body,
                     data=data,
-                    headers=headers or None,
+                    headers=request_headers or None,
                     timeout=request_timeout,
                 )
             except requests.RequestException as exc:
@@ -117,6 +254,15 @@ class BlueskyAdapter:
                     time.sleep(0.7 * (2**attempt))
                     continue
                 raise BlueskyAPIError(f"Bluesky request failed ({method} {path}): {exc}") from exc
+
+            if auth and not auth_recovered and self._is_expired_auth_response(response):
+                try:
+                    self._recover_session()
+                except Exception:
+                    pass
+                else:
+                    auth_recovered = True
+                    continue
 
             if (
                 response.status_code in self.RETRYABLE_STATUS_CODES
@@ -159,25 +305,10 @@ class BlueskyAdapter:
         if self._access_jwt and self._did:
             return
 
-        payload = self._request(
-            "POST",
-            "/xrpc/com.atproto.server.createSession",
-            json_body={"identifier": self.config.handle, "password": self.config.app_password},
-            auth=False,
-        )
-        if not isinstance(payload, dict):
-            raise BlueskyAPIError("Unexpected createSession payload type.")
+        if self._load_cached_session():
+            return
 
-        access_jwt = str(payload.get("accessJwt", "")).strip()
-        did = str(payload.get("did", "")).strip()
-        handle = str(payload.get("handle", "")).strip()
-
-        if not access_jwt or not did:
-            raise BlueskyAPIError("createSession response missing accessJwt or did.")
-
-        self._access_jwt = access_jwt
-        self._did = did
-        self._resolved_handle = handle or self.config.handle
+        self._create_session()
 
     def verify_account(self) -> dict:
         """Validate credentials and return account identity fields."""
@@ -195,6 +326,10 @@ class BlueskyAdapter:
         if handle and rkey:
             return f"https://bsky.app/profile/{handle}/post/{rkey}"
         return ""
+
+    def public_post_url(self, uri: str) -> str:
+        """Return a public Bluesky URL for one at:// post URI."""
+        return self._public_post_url(uri)
 
     def _mime_for_path(self, file_path: Path) -> str:
         """Return mime type hint for upload blob endpoint."""

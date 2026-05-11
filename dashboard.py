@@ -12,15 +12,18 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from alerts import classify_openai_error_text, is_fatal_openai_category, send_slack_alert
 from persona import get_persona_state
+from slack_control import PID_PATH as SLACK_CONTROL_PID_PATH
 from storage import init_storage, list_published_posts
 
 
@@ -34,17 +37,20 @@ PORT = 8787
 RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?$")
 URL_RE = re.compile(r"https?://[^\s<>'\"]+")
 TIME_HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+JOB_REPLIED_RE = re.compile(r"\breplied=(?:[1-9]\d*)\b", re.IGNORECASE)
 
 GENERATE_INTERVAL_HOURS = list(range(1, 25))
 MENTION_INTERVAL_MINUTES = [1, 5, 10, 15, 20, 30, 60]
-PUBLISH_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress")
-MENTION_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress")
+PUBLISH_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress", "instagram")
+MENTION_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress", "instagram")
 DEFAULT_ACTIVE_PUBLISH_PLATFORMS = ["mastodon"]
 DEFAULT_ACTIVE_MENTION_PLATFORMS = ["mastodon", "bluesky"]
+GENERATE_MISS_GRACE_SECONDS = 20 * 60
 PLATFORM_DISPLAY_NAMES = {
     "mastodon": "Mastodon",
     "bluesky": "Bluesky",
     "wordpress": "WordPress",
+    "instagram": "Instagram",
 }
 
 
@@ -98,6 +104,8 @@ ACTIVE_PUBLISH_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS)
 ACTIVE_MENTION_PLATFORMS: list[str] = list(DEFAULT_ACTIVE_MENTION_PLATFORMS)
 GENERATE_START_TIME = ""
 SCHED_STOP_PREFIX = "__SCHED_STOP__:"
+SLACK_CONTROL_LAST_RESULT = ""
+LAST_GENERATE_MISS_ALERT_KEY = ""
 
 
 def _validate_generate_interval_seconds(value: int) -> int:
@@ -180,7 +188,7 @@ def _active_mention_platform_arg(platforms: list[str]) -> str:
         return "all"
     if len(normalized) == 1:
         return normalized[0]
-    return normalized[0]
+    return ",".join(normalized)
 
 
 def _get_active_publish_platforms() -> list[str]:
@@ -330,6 +338,18 @@ def _stamp_from_dt(value: datetime) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_local_stamp(value: str) -> datetime | None:
+    """Parse dashboard local timestamp string."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.astimezone()
+
+
 def _future_stamp(seconds: int) -> str:
     """Return local timestamp offset by given seconds."""
     return (_now_dt() + timedelta(seconds=max(0, int(seconds)))).strftime("%Y-%m-%d %H:%M:%S")
@@ -362,6 +382,34 @@ def _list_run_dirs() -> list[str]:
     """Return publishable run directory names, newest first."""
     runs = [p.name for p in _list_publishable_run_paths()]
     return sorted(runs, reverse=True)
+
+
+def _parse_run_dir_timestamp(name: str) -> datetime | None:
+    """Parse local timestamp from a run directory name."""
+    raw = (name or "").strip()
+    if not raw:
+        return None
+    base = raw.split("-", 6)[:6]
+    if len(base) != 6:
+        return None
+    stamp = "-".join(base)
+    try:
+        parsed = datetime.strptime(stamp, "%Y-%m-%d-%H-%M-%S")
+    except ValueError:
+        return None
+    return parsed.astimezone()
+
+
+def _latest_generated_run_time() -> datetime | None:
+    """Return newest generated run timestamp from output folders."""
+    latest: datetime | None = None
+    for path in _list_publishable_run_paths():
+        parsed = _parse_run_dir_timestamp(path.name)
+        if parsed is None:
+            continue
+        if latest is None or parsed > latest:
+            latest = parsed
+    return latest
 
 
 def _parse_run_manifest(manifest_path: Path) -> list[Path]:
@@ -455,6 +503,65 @@ def _trim_output(text: str) -> str:
     return "[...output trimmed...]\n" + text[-MAX_OUTPUT_CHARS:]
 
 
+def _slack_control_pid() -> int | None:
+    """Return running Slack control pid from pid file when valid."""
+    try:
+        raw = SLACK_CONTROL_PID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def _slack_control_snapshot() -> dict[str, str | bool | int]:
+    """Return immutable Slack control service state for UI rendering."""
+    pid = _slack_control_pid()
+    return {
+        "running": bool(pid),
+        "pid": pid or 0,
+        "last_result": SLACK_CONTROL_LAST_RESULT,
+    }
+
+
+def _start_slack_control_listener() -> None:
+    """Start Slack control listener unless already running."""
+    global SLACK_CONTROL_LAST_RESULT
+    pid = _slack_control_pid()
+    if pid:
+        SLACK_CONTROL_LAST_RESULT = f"already running (pid={pid})"
+        return
+    _enqueue_job(
+        label="Start Slack Control Listener",
+        command=[sys.executable, "slack_control.py"],
+        background=True,
+    )
+    SLACK_CONTROL_LAST_RESULT = "launch requested"
+
+
+def _stop_slack_control_listener() -> None:
+    """Stop Slack control listener if it is running."""
+    global SLACK_CONTROL_LAST_RESULT
+    pid = _slack_control_pid()
+    if not pid:
+        SLACK_CONTROL_LAST_RESULT = "already stopped"
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        SLACK_CONTROL_LAST_RESULT = f"stop failed: {exc}"
+        return
+    SLACK_CONTROL_LAST_RESULT = f"stop requested (pid={pid})"
+
+
 def _create_job(label: str, command: list[str]) -> Job:
     """Create and register job row in memory."""
     global NEXT_JOB_ID
@@ -474,11 +581,12 @@ def _create_job(label: str, command: list[str]) -> Job:
 
 
 def _run_job(job: Job) -> None:
-    """Execute job command and capture combined output."""
+    """Execute job command and stream combined output into in-memory job state."""
     with JOB_LOCK:
         job.status = "running"
 
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     try:
         proc = subprocess.Popen(
             job.command,
@@ -486,12 +594,18 @@ def _run_job(job: Job) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
             env=env,
         )
-        stdout, _ = proc.communicate()
-        output = stdout or ""
-        status = "succeeded" if proc.returncode == 0 else "failed"
-        return_code = proc.returncode
+        output_parts: list[str] = []
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                output_parts.append(line)
+                with JOB_LOCK:
+                    job.output = _trim_output("".join(output_parts))
+        return_code = proc.wait()
+        output = "".join(output_parts)
+        status = "succeeded" if return_code == 0 else "failed"
     except Exception as exc:
         output = f"Failed to execute command: {exc}"
         status = "failed"
@@ -521,6 +635,14 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
     def _cmd_generate(_: dict[str, str]) -> list[str]:
         return [sys.executable, "main.py"]
 
+    def _cmd_generate_from_url(payload: dict[str, str]) -> list[str] | None:
+        article_url = (payload.get("article_url") or "").strip()
+        if not article_url:
+            return None
+        if not URL_RE.fullmatch(article_url):
+            return None
+        return [sys.executable, "main.py", "--article-url", article_url]
+
     def _cmd_publish_latest(_: dict[str, str]) -> list[str]:
         platform_arg = _active_publish_platform_arg(_get_active_publish_platforms())
         return [sys.executable, "orchestrator.py", "--platform", platform_arg]
@@ -541,6 +663,19 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
             platform_arg,
         ]
 
+    def _cmd_generate_video_selected(payload: dict[str, str]) -> list[str] | None:
+        run_dir = (payload.get("run_dir") or "").strip()
+        if not run_dir:
+            return None
+        if not RUN_DIR_RE.match(run_dir):
+            return None
+        return [
+            sys.executable,
+            "generate_video.py",
+            "--run-dir",
+            f"output/{run_dir}",
+        ]
+
     def _cmd_mentions(_: dict[str, str]) -> list[str]:
         platform_arg = _active_mention_platform_arg(_get_active_mention_platforms())
         return [sys.executable, "engage.py", "--platform", platform_arg]
@@ -554,14 +689,20 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
     def _cmd_mentions_wordpress(_: dict[str, str]) -> list[str]:
         return [sys.executable, "engage.py", "--platform", "wordpress"]
 
+    def _cmd_mentions_instagram(_: dict[str, str]) -> list[str]:
+        return [sys.executable, "engage.py", "--platform", "instagram"]
+
     return {
         "generate": ("Generate Post", _cmd_generate),
+        "generate_from_url": ("Generate Post From URL", _cmd_generate_from_url),
         "publish_latest": ("Publish Latest Run", _cmd_publish_latest),
         "publish_selected": ("Publish Selected Run", _cmd_publish_selected),
+        "generate_video_selected": ("Generate Video", _cmd_generate_video_selected),
         "check_mentions": ("Check Mentions (All)", _cmd_mentions),
         "check_mentions_mastodon": ("Check Mentions (Mastodon)", _cmd_mentions_mastodon),
         "check_mentions_bluesky": ("Check Mentions (Bluesky)", _cmd_mentions_bluesky),
         "check_mentions_wordpress": ("Check Mentions (WordPress)", _cmd_mentions_wordpress),
+        "check_mentions_instagram": ("Check Mentions (Instagram)", _cmd_mentions_instagram),
     }
 
 
@@ -585,9 +726,19 @@ def _run_generate_publish_cycle() -> str:
     try:
         if gen_job.status != "succeeded":
             category = classify_openai_error_text(gen_job.output or "")
+            output_excerpt = " ".join((gen_job.output or "").strip().split())[-600:] or "N/A"
             base_message = (
                 f"main.py failed (rc={gen_job.return_code}, "
                 f"openai_category={category})."
+            )
+            send_slack_alert(
+                title="Copierbot scheduled generation failed",
+                message=(
+                    f"Job: `Scheduled Generate Post`\n"
+                    f"Category: `{category}`\n"
+                    f"Return code: `{gen_job.return_code}`\n"
+                    f"Output excerpt: `{output_excerpt}`"
+                ),
             )
             if is_fatal_openai_category(category):
                 send_slack_alert(
@@ -604,6 +755,14 @@ def _run_generate_publish_cycle() -> str:
 
         created = _parse_run_manifest(manifest_path)
         if not created:
+            send_slack_alert(
+                title="Copierbot scheduled generation produced no run",
+                message=(
+                    "main.py reported success, but the generate scheduler did not receive any "
+                    "run-manifest entries to publish.\n"
+                    "Action: check generation output and scheduler state."
+                ),
+            )
             return "main.py succeeded; no run-manifest entries found."
 
         active_platforms = _get_active_publish_platforms()
@@ -824,7 +983,85 @@ def _scheduler_snapshot() -> dict[str, dict[str, str | int | bool]]:
                 "next_run_at": state.next_run_at,
                 "last_result": state.last_result,
             }
-        return snap
+    return snap
+
+
+def _send_generate_miss_alert(expected_run_dt: datetime, last_seen: str, context: str) -> None:
+    """Send one Slack alert for a missed scheduled generate run."""
+    global LAST_GENERATE_MISS_ALERT_KEY
+    alert_key = expected_run_dt.strftime("%Y-%m-%d %H:%M:%S")
+    if LAST_GENERATE_MISS_ALERT_KEY == alert_key:
+        return
+    active_platforms = _platforms_display_label(_get_active_publish_platforms())
+    send_slack_alert(
+        title="Copierbot scheduled generation missed",
+        message=(
+            f"Expected run: `{alert_key}` local\n"
+            f"Grace period: `{GENERATE_MISS_GRACE_SECONDS // 60} minutes`\n"
+            f"Last seen generation/run: `{last_seen or 'N/A'}`\n"
+            f"Active publish platforms: `{active_platforms}`\n"
+            f"Context: {context}"
+        ),
+    )
+    LAST_GENERATE_MISS_ALERT_KEY = alert_key
+
+
+def _maybe_alert_if_generate_already_missed_before_startup() -> None:
+    """Alert if dashboard starts after today's expected run was already missed."""
+    start_time = _normalize_generate_start_time(_get_generate_start_time())
+    if not start_time:
+        return
+    expected_today = _next_occurrence_for_time(start_time, now=_now_dt() - timedelta(days=1))
+    now_local = _now_dt()
+    if now_local <= expected_today + timedelta(seconds=GENERATE_MISS_GRACE_SECONDS):
+        return
+    latest_run = _latest_generated_run_time()
+    if latest_run is not None and latest_run >= expected_today:
+        return
+    _send_generate_miss_alert(
+        expected_run_dt=expected_today,
+        last_seen=_stamp_from_dt(latest_run) if latest_run is not None else "",
+        context="dashboard startup detected that the scheduled generation time had already passed without a new run folder.",
+    )
+
+
+def _maybe_alert_on_missed_generate_run() -> None:
+    """Send one Slack alert if the next scheduled generate run is overdue."""
+    global LAST_GENERATE_MISS_ALERT_KEY
+    with SCHED_LOCK:
+        state = SCHEDULERS["generate_publish"]
+        if not state.running:
+            return
+        next_run_at = state.next_run_at
+        last_run_at = state.last_run_at
+    next_run_dt = _parse_local_stamp(next_run_at)
+    if next_run_dt is None:
+        return
+    now_local = _now_dt()
+    if now_local <= next_run_dt + timedelta(seconds=GENERATE_MISS_GRACE_SECONDS):
+        return
+    last_run_dt = _parse_local_stamp(last_run_at)
+    if last_run_dt is not None and last_run_dt >= next_run_dt:
+        return
+    _send_generate_miss_alert(
+        expected_run_dt=next_run_dt,
+        last_seen=last_run_at,
+        context="the generate scheduler remained overdue beyond the grace period while the dashboard was running.",
+    )
+    with SCHED_LOCK:
+        state = SCHEDULERS["generate_publish"]
+        if state.running and state.next_run_at == next_run_at:
+            state.last_result = f"alerted: missed scheduled generate run due at {_stamp_from_dt(next_run_dt)} local."
+
+
+def _scheduler_watchdog_loop() -> None:
+    """Background watchdog for alerting on missed scheduled generate runs."""
+    while True:
+        try:
+            _maybe_alert_on_missed_generate_run()
+        except Exception:
+            pass
+        time.sleep(60)
 
 
 def _render_job_card(job: Job) -> str:
@@ -833,18 +1070,92 @@ def _render_job_card(job: Job) -> str:
     output = _render_output_with_links(job.output or "(no output)")
     return_code = "" if job.return_code is None else f" | rc={job.return_code}"
     finished = f" | finished={html.escape(job.finished_at)}" if job.finished_at else ""
+    status_label = job.status
+    extra_meta = ""
+    if (
+        job.status == "succeeded"
+        and any(part.endswith("engage.py") or part == "engage.py" for part in job.command)
+        and JOB_REPLIED_RE.search(job.output or "")
+    ):
+        status_label = "succeeded - replied to comment"
+    if job.status == "failed":
+        video_failure = _video_failure_summary(job)
+        if video_failure:
+            status_label = f"failed - {video_failure.lower()}"
+            extra_meta = f"<div class='meta error-meta'>video error: {html.escape(video_failure)}</div>"
 
     return (
         "<article class='job'>"
         f"<div><strong>#{job.job_id}</strong> {html.escape(job.label)}</div>"
         f"<div class='meta'>started={html.escape(job.started_at)}{finished}{return_code}</div>"
-        f"<div class='status {html.escape(job.status)}'>{html.escape(job.status)}</div>"
+        f"<div class='status {html.escape(job.status)}'>{html.escape(status_label)}</div>"
         f"<div class='meta'>cmd: <code>{command_text}</code></div>"
+        f"{extra_meta}"
         "<details><summary>Output</summary>"
         f"<pre>{output}</pre>"
         "</details>"
         "</article>"
     )
+
+
+def _job_uses_script(job: Job, script_name: str) -> bool:
+    """Return True when the tracked command runs the given script."""
+    return any(part.endswith(script_name) or part == script_name for part in job.command)
+
+
+def _extract_job_run_dir_name(job: Job) -> str:
+    """Return run dir name from --run-dir arg when present."""
+    for index, part in enumerate(job.command):
+        if part == "--run-dir" and index + 1 < len(job.command):
+            raw = str(job.command[index + 1]).strip()
+            return Path(raw).name
+    return ""
+
+
+def _video_failure_summary(job: Job) -> str:
+    """Return concise video failure detail from saved result JSON when available."""
+    if not _job_uses_script(job, "generate_video.py"):
+        return ""
+    run_name = _extract_job_run_dir_name(job)
+    if not run_name or not RUN_DIR_RE.match(run_name):
+        return ""
+    run_dir = OUTPUT_DIR / run_name
+    if not run_dir.is_dir():
+        return ""
+    candidates = sorted(
+        (
+            path
+            for path in run_dir.iterdir()
+            if path.is_file()
+            and path.name.startswith("video_result  ")
+            and path.suffix.lower() == ".json"
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        failed = payload.get("failed")
+        if not isinstance(failed, dict):
+            continue
+        status = failed.get("status")
+        if isinstance(status, dict):
+            provider_error = str(status.get("error", "")).strip()
+            if provider_error:
+                return provider_error
+        error_text = str(failed.get("error", "")).strip()
+        if error_text:
+            return error_text
+    for line in reversed((job.output or "").splitlines()):
+        cleaned = line.strip()
+        if cleaned.startswith("RuntimeError:") or cleaned.startswith("TimeoutError:"):
+            return cleaned.split(":", 1)[1].strip()
+    return ""
 
 
 def _split_url_punctuation(token: str) -> tuple[str, str]:
@@ -942,6 +1253,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _start_mentions_scheduler_from_settings(minutes=minutes)
         elif action == "stop_mentions_scheduler":
             _stop_scheduler("mentions")
+        elif action == "start_slack_control":
+            _start_slack_control_listener()
+        elif action == "stop_slack_control":
+            _stop_slack_control_listener()
 
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/")
@@ -971,9 +1286,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         last_job = jobs[0] if jobs else None
         alert_html = ""
         if last_job:
+            last_suffix = ""
+            if last_job.status == "failed":
+                failure_summary = _video_failure_summary(last_job)
+                if failure_summary:
+                    last_suffix = f" - {html.escape(failure_summary)}"
             alert_html = (
                 f"<div class='alert'>Last job: #{last_job.job_id} {html.escape(last_job.label)} "
-                f"[{html.escape(last_job.status)}]</div>"
+                f"[{html.escape(last_job.status)}]{last_suffix}</div>"
             )
 
         run_options = "\n".join(
@@ -986,6 +1306,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         gp = sched["generate_publish"]
         mn = sched["mentions"]
+        slack_control = _slack_control_snapshot()
         active_publish_platforms = _get_active_publish_platforms()
         active_publish_platform_arg = _active_publish_platform_arg(active_publish_platforms)
         active_publish_platforms_label = _platforms_display_label(active_publish_platforms)
@@ -1061,7 +1382,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         var(--bg);
       min-height: 100vh;
     }}
-    .wrap {{ max-width: 1080px; margin: 0 auto; padding: 1.1rem; }}
+    .wrap {{
+      width: min(96vw, 1920px);
+      max-width: none;
+      margin: 0 auto;
+      padding: 1.1rem 1.4rem 1.6rem;
+    }}
     h1 {{ margin: 0 0 0.7rem; font-size: 1.6rem; letter-spacing: 0.01em; }}
     h2 {{ margin: 0 0 0.55rem; font-size: 1rem; }}
     .sub {{ margin: 0 0 1rem; color: var(--muted); font-size: 0.95rem; }}
@@ -1091,7 +1417,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     }}
     .stats {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
       gap: 0.55rem;
       margin-bottom: 1rem;
     }}
@@ -1103,13 +1429,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
     }}
     .stat .k {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }}
     .stat .v {{ font-size: 1rem; font-weight: 700; margin-top: 0.1rem; }}
-    .grid {{ display: grid; gap: 0.9rem; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }}
+    .grid {{
+      display: grid;
+      gap: 0.9rem;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      align-items: stretch;
+    }}
+    .compact-grid {{
+      display: flex;
+      gap: 0.9rem;
+      flex-wrap: wrap;
+      align-items: stretch;
+    }}
+    .compact-grid > .card {{
+      flex: 0 1 calc(25% - 0.7rem);
+      max-width: calc(25% - 0.7rem);
+      min-width: 220px;
+    }}
     .card {{
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 0.9rem;
       box-shadow: 0 3px 10px rgba(0,0,0,0.04);
+      height: 100%;
     }}
     .hint {{ margin: 0 0 0.6rem; color: var(--muted); font-size: 0.86rem; line-height: 1.3; }}
     .sched-meta {{ margin: 0.25rem 0; color: var(--muted); font-size: 0.84rem; line-height: 1.35; }}
@@ -1138,7 +1481,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
       border: 1px solid var(--border);
       background: #fff;
     }}
-    input[type="time"] {{
+    input[type="time"], input[type="url"] {{
       width: 100%;
       margin-bottom: 0.5rem;
       padding: 0.5rem;
@@ -1155,6 +1498,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
       padding: 0.75rem;
     }}
     .meta {{ color: var(--muted); font-size: 0.85rem; }}
+    .error-meta {{ color: #b91c1c; font-weight: 600; }}
     .status {{ font-weight: 700; text-transform: uppercase; font-size: 0.8rem; }}
     .status.running {{ color: #0f766e; }}
     .status.failed {{ color: #b91c1c; }}
@@ -1171,6 +1515,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
       word-break: break-word;
       font-size: 0.8rem;
       max-height: 280px;
+    }}
+    @media (max-width: 720px) {{
+      .wrap {{
+        width: 100%;
+        padding: 0.9rem;
+      }}
+      .grid {{
+        grid-template-columns: 1fr;
+      }}
+      .compact-grid {{
+        display: grid;
+        grid-template-columns: 1fr;
+      }}
+      .compact-grid > .card {{
+        max-width: none;
+        min-width: 0;
+      }}
     }}
   </style>
 </head>
@@ -1274,15 +1635,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
           <button class="stop" type="submit">Stop Mention Scheduler</button>
         </form>
       </div>
+
+      <div class="card">
+        <h2>Slack Control</h2>
+        <p class="hint">Runs <code>slack_control.py</code> to listen for DM commands from the separate Slack control app. Requires <code>SLACK_CONTROL_BOT_TOKEN</code>, <code>SLACK_CONTROL_APP_TOKEN</code>, and <code>SLACK_CONTROL_ALLOWED_USER_IDS</code> in <code>.env</code>.</p>
+        <div class="sched-status {'running' if bool(slack_control['running']) else 'stopped'}">{'running' if bool(slack_control['running']) else 'stopped'}</div>
+        <p class="sched-meta">PID: {html.escape(str(slack_control['pid']) if int(slack_control['pid']) else 'N/A')}</p>
+        <p class="sched-meta">Last result: {html.escape(str(slack_control['last_result']) or 'N/A')}</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="start_slack_control" />
+          <button type="submit">Start Slack Control Listener</button>
+        </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="stop_slack_control" />
+          <button class="stop" type="submit">Stop Slack Control Listener</button>
+        </form>
+      </div>
     </div>
 
-    <div class="grid" style="margin-top:0.9rem;">
+    <div class="compact-grid" style="margin-top:0.9rem;">
       <div class="card">
         <h2>Generate</h2>
         <p class="hint">Runs <code>main.py</code> to create a new Copierbot post in a fresh timestamped output folder.</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="generate" />
           <button type="submit">Run main.py</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Generate From URL</h2>
+        <p class="hint">Runs <code>main.py --article-url ...</code> to create a normal timestamped news-style run from one webpage you supply directly, instead of choosing from the news feed.</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="generate_from_url" />
+          <input
+            type="url"
+            name="article_url"
+            placeholder="https://example.com/article"
+            required
+          />
+          <button type="submit">Generate From Webpage URL</button>
         </form>
       </div>
 
@@ -1297,8 +1689,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
       </div>
 
       <div class="card">
+        <h2>Publish Specific Run</h2>
+        <p class="hint">Select a run folder, then publish only that specific output instead of the latest one, to active destinations.</p>
+        <p class="sched-meta">Active platforms: {html.escape(active_publish_platforms_label)}</p>
+        <form method="post" action="/run">
+          <input type="hidden" name="action" value="publish_selected" />
+          <select id="publish-run-dir" name="run_dir">{run_options}</select>
+          <button type="submit">Publish Selected Folder</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="compact-grid" style="margin-top:0.9rem;">
+      <div class="card">
         <h2>Check Mentions</h2>
-        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing check-ins. "All Platforms" follows active mention sources.</p>
+        <p class="hint">Runs <code>engage.py</code> to fetch mentions and auto-reply to qualifying wellbeing, identity, contact, memory, and similar prompts. "All Platforms" follows active mention sources.</p>
         <p class="sched-meta">Active platforms: {html.escape(active_mention_platforms_label)}</p>
         <form method="post" action="/run">
           <input type="hidden" name="action" value="check_mentions" />
@@ -1316,16 +1721,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
           <input type="hidden" name="action" value="check_mentions_wordpress" />
           <button type="submit">Check Mentions (WordPress)</button>
         </form>
+        <form method="post" action="/run" style="margin-top:0.5rem;">
+          <input type="hidden" name="action" value="check_mentions_instagram" />
+          <button type="submit">Check Mentions (Instagram)</button>
+        </form>
       </div>
 
       <div class="card">
-        <h2>Publish Specific Run</h2>
-        <p class="hint">Select a run folder, then publish only that specific output instead of the latest one, to active destinations.</p>
-        <p class="sched-meta">Active platforms: {html.escape(active_publish_platforms_label)}</p>
+        <h2>Generate Video</h2>
+        <p class="hint">Select a news run folder and send its saved image plus a motion prompt derived from <code>prompt  *.txt</code> to Higgsfield DoP Lite. This is manual-only and never runs automatically on dashboard startup.</p>
         <form method="post" action="/run">
-          <input type="hidden" name="action" value="publish_selected" />
-          <select name="run_dir">{run_options}</select>
-          <button type="submit">Publish Selected Folder</button>
+          <input type="hidden" name="action" value="generate_video_selected" />
+          <select id="video-run-dir" name="run_dir">{run_options}</select>
+          <button type="submit">Generate Higgsfield Video</button>
         </form>
       </div>
     </div>
@@ -1337,12 +1745,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
   </div>
   <script>
     (() => {{
-      const key = "copierbot_dashboard_auto_refresh";
+      const autoRefreshKey = "copierbot_dashboard_auto_refresh";
+      const publishRunKey = "copierbot_dashboard_publish_run_dir";
+      const videoRunKey = "copierbot_dashboard_video_run_dir";
       const intervalMs = 15000;
       const refreshBtn = document.getElementById("refresh-now");
       const checkbox = document.getElementById("auto-refresh");
       const status = document.getElementById("auto-status");
+      const publishRunSelect = document.getElementById("publish-run-dir");
+      const videoRunSelect = document.getElementById("video-run-dir");
       let timer = null;
+
+      const restoreSelect = (selectEl, storageKey) => {{
+        if (!selectEl) return;
+        const saved = window.localStorage.getItem(storageKey);
+        if (saved && [...selectEl.options].some((option) => option.value === saved)) {{
+          selectEl.value = saved;
+        }}
+        selectEl.addEventListener("change", () => {{
+          window.localStorage.setItem(storageKey, selectEl.value || "");
+        }});
+      }};
 
       const apply = (enabled) => {{
         if (timer) {{
@@ -1356,12 +1779,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
           status.textContent = "Off";
         }}
         checkbox.checked = !!enabled;
-        window.localStorage.setItem(key, enabled ? "1" : "0");
+        window.localStorage.setItem(autoRefreshKey, enabled ? "1" : "0");
       }};
 
       refreshBtn.addEventListener("click", () => window.location.reload());
       checkbox.addEventListener("change", () => apply(checkbox.checked));
-      apply(window.localStorage.getItem(key) === "1");
+      restoreSelect(publishRunSelect, publishRunKey);
+      restoreSelect(videoRunSelect, videoRunKey);
+      apply(window.localStorage.getItem(autoRefreshKey) === "1");
     }})();
   </script>
 </body>
@@ -1375,11 +1800,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server that can rebind immediately after restarts."""
+
+    allow_reuse_address = True
+
+
 def run_server() -> None:
     """Run local-only dashboard server."""
+    _maybe_alert_if_generate_already_missed_before_startup()
     _start_generate_scheduler_from_settings()
     _start_mentions_scheduler_from_settings()
-    server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
+    _start_slack_control_listener()
+    watchdog = threading.Thread(
+        target=_scheduler_watchdog_loop,
+        daemon=True,
+        name="copierbot-scheduler-watchdog",
+    )
+    watchdog.start()
+    server = ReusableThreadingHTTPServer((HOST, PORT), DashboardHandler)
     print(f"Copierbot dashboard listening on http://{HOST}:{PORT}")
     try:
         server.serve_forever()

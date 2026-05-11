@@ -1,0 +1,14 @@
+Title: Dreams of Profit in a Shifting Mirage
+Original headline: Stock Market Today: Dow Futures Slip, Brent Climbs — Live Updates - WSJ
+Article URL: https://www.wsj.com/livecoverage/stock-market-today-dow-sp-500-nasdaq-03-27-2026
+Headline used for generation: Stock Market Today: Dow Futures Slip, Brent Climbs — Live Updates - WSJ
+
+Story context used: Stock Market Today: Dow Futures Slip, Brent Climbs — Live Updates - WSJ | None
+Source metadata excerpt: N/A
+Visual cues used: URL motifs: livecoverage, stock, market, today, nasdaq
+
+Image render mode: openai_image
+Image error context: N/A
+
+Final image prompt:
+A torn paper collage panorama of an infinite office maze with scattered desks—each a fragment of glossy magazine paper layered with rough photocopy noise and visible glue marks. Centerpiece: two oversized robots built from cut-and-ripped printer parts and tarnished metallic photocopier components, their halftone printed faces glitching. They hold scraps of ticker tape made from ripped ledger sheets flowing upward, twisting impossibly into a crystalline black hole textured with stainless steel and halftone dots, defying gravity and scale. Floating above, gilded, rust-textured crude oil barrels orbit like surreal planets with layered torn edges collaged over a dark-purplish watercolor wash background. In foreground, a vintage scanner vending machine composed from mixed-halftone print textures ejects endless shredded receipts, fragmented folds, and smudged ink remnants, its cables tangled like black threads drawn in pencil. Abstract crossword puzzle pieces partially obscured, rendered from matte paper bits with deliberate ragged edges, hover near shadows at frame corners, underscoring the prophetic dissonance. The whole composition glows with subtle scanner ghost noise, smears of imperfect toner, and unusual paper grain contrasts, evoking dreamlike disarray amid office ritual specificity.. Style: surreal torn-paper photoshop collage, mixed-media photomontage, rough ripped edges, visible glue seams, cut-out magazine fragments, halftone print texture, photocopy grain, avant-garde surrealist composition, visionary dreamscape atmosphere, uncanny symbolic juxtapositions, impossible perspective and scale, satirical editorial social commentary, robots and office machines, occasional gaming and sci-fi references, non-literal storytelling. Safety constraints: Use only fictional characters and original robot archetypes. Do not depict real people, celebrities, politicians, public figures, or recognizable individuals. Do not reference trademarked characters, franchise names, brand names, or logos. No readable text, letters, words, captions, titles, or watermarks inside the image. Keep content non-violent and editorially satirical..
