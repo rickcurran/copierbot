@@ -12,7 +12,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from alerts import send_slack_alert
 from social.bluesky_adapter import BlueskyAdapter, BlueskyAPIError, load_bluesky_config
-from social.instagram_adapter import InstagramAdapter, InstagramAPIError, load_instagram_config
+from social.instagram_adapter import (
+    clear_instagram_token_alert_state,
+    InstagramAdapter,
+    InstagramAPIError,
+    instagram_token_error_guidance,
+    instagram_token_expiry_warning,
+    is_instagram_token_error_message,
+    load_instagram_config,
+    should_send_instagram_token_alert,
+)
 from social_image import build_social_composite_image
 from social.mastodon_adapter import MastodonAdapter, MastodonAPIError, load_mastodon_config
 from social_posting import append_ai_disclosure
@@ -66,6 +75,10 @@ def _send_publish_failure_alert(
     if post_type:
         message_lines.append(f"Post type: `{post_type}`")
     message_lines.append(f"Error: {error.strip() or 'unknown error'}")
+    if failed_platform == "instagram" and is_instagram_token_error_message(error):
+        if not should_send_instagram_token_alert(context="publishing", error_text=error):
+            return
+        message_lines.append(f"Action: {instagram_token_error_guidance(error)}")
     send_slack_alert(title="Copierbot publish failed", message="\n".join(message_lines))
 
 
@@ -858,8 +871,12 @@ def main() -> int:
                     if instagram_adapter is None:
                         instagram_config = load_instagram_config(required=True)
                         assert instagram_config is not None
+                        instagram_warning = instagram_token_expiry_warning(instagram_config)
+                        if instagram_warning:
+                            logging.warning("Instagram token warning: %s", instagram_warning)
                         instagram_adapter = InstagramAdapter(instagram_config)
                         instagram_account = instagram_adapter.verify_account()
+                        clear_instagram_token_alert_state()
                         logging.info(
                             "Instagram account verified: @%s",
                             instagram_account.get("username", "unknown"),

@@ -8,3 +8,6 @@ logs/
 *.log
 data/bluesky_session.json
 data/slack_control.pid
+data/instagram_token_alert_state.json
+data/instagram_token_expiry_alert_state.json
+copierbot-run-manifest-*.txt

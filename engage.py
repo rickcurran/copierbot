@@ -17,7 +17,16 @@ from persona import get_persona_context, get_persona_state
 from quote_bank import QuoteBankError, load_quote_bank
 from alerts import send_slack_alert
 from social.bluesky_adapter import BlueskyAPIError, BlueskyAdapter, load_bluesky_config
-from social.instagram_adapter import InstagramAPIError, InstagramAdapter, load_instagram_config
+from social.instagram_adapter import (
+    clear_instagram_token_alert_state,
+    InstagramAPIError,
+    InstagramAdapter,
+    instagram_token_error_guidance,
+    instagram_token_expiry_warning,
+    is_instagram_token_error_message,
+    load_instagram_config,
+    should_send_instagram_token_alert,
+)
 from social.mastodon_adapter import MastodonAPIError, MastodonAdapter, load_mastodon_config
 from social.wordpress_adapter import WordpressAPIError, WordpressAdapter, load_wordpress_config
 from social_posting import append_ai_disclosure, disclosure_overhead_chars
@@ -733,6 +742,23 @@ def _send_reply_slack_alert(
     if response_url:
         message_lines.append(f"Response URL: {response_url}")
     send_slack_alert(title=title, message="\n".join(message_lines))
+
+
+def _send_instagram_token_slack_alert(*, operation: str, error_text: str) -> None:
+    """Send a focused Slack alert for Instagram token failures."""
+    if not should_send_instagram_token_alert(context=operation, error_text=error_text):
+        return
+    send_slack_alert(
+        title="Copierbot Instagram token problem",
+        message="\n".join(
+            [
+                f"Operation: `{operation}`",
+                "Platform: `instagram`",
+                f"Error: {error_text.strip() or 'unknown error'}",
+                f"Action: {instagram_token_error_guidance(error_text)}",
+            ]
+        ),
+    )
 
 
 def _mastodon_source_url(adapter: MastodonAdapter, mention_id: str) -> str:
@@ -1986,8 +2012,12 @@ def run() -> None:
                 if instagram_config is None:
                     logging.warning("Skipping Instagram mention processing: config not set.")
                     continue
+                instagram_warning = instagram_token_expiry_warning(instagram_config)
+                if instagram_warning:
+                    logging.warning("Instagram token warning: %s", instagram_warning)
                 adapter = InstagramAdapter(instagram_config)
                 account = adapter.verify_account()
+                clear_instagram_token_alert_state()
                 self_username = str(account.get("username", "")).strip()
                 max_chars = instagram_config.comment_text_max_chars
 
@@ -2022,6 +2052,11 @@ def run() -> None:
             WordpressAPIError,
             InstagramAPIError,
         ) as exc:
+            if platform == "instagram" and is_instagram_token_error_message(str(exc)):
+                _send_instagram_token_slack_alert(
+                    operation="mention monitoring",
+                    error_text=str(exc),
+                )
             platform_failures.append((platform, str(exc)))
             logging.error("%s mention processing failed: %s", platform.capitalize(), exc)
             continue

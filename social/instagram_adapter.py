@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 import os
+from pathlib import Path
+import re
 from typing import Any
 import time
 
@@ -18,6 +22,7 @@ class InstagramConfig:
     base_url: str
     ig_user_id: str
     access_token: str
+    access_token_expires_at: datetime | None = None
     api_version: str = "v23.0"
     timeout_seconds: int = 30
     caption_max_chars: int = 2200
@@ -29,12 +34,215 @@ class InstagramAPIError(RuntimeError):
     """Raised for HTTP or protocol-level Instagram API failures."""
 
 
+INSTAGRAM_TOKEN_ALERT_STATE_PATH = Path("data/instagram_token_alert_state.json")
+INSTAGRAM_TOKEN_EXPIRY_ALERT_STATE_PATH = Path("data/instagram_token_expiry_alert_state.json")
+
+
+def _parse_instagram_token_expiry(raw_value: str) -> datetime | None:
+    """Parse optional Instagram token expiry timestamp from environment."""
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _redact_access_token(text: str) -> str:
+    """Redact access_token query values from error strings."""
+    return re.sub(r"(access_token=)[^&\s]+", r"\1[REDACTED]", text or "", flags=re.IGNORECASE)
+
+
+def instagram_token_expiry_warning(
+    config: InstagramConfig,
+    *,
+    warning_days: int = 7,
+    now: datetime | None = None,
+) -> str:
+    """Return a warning string when the configured token is near expiry."""
+    expires_at = config.access_token_expires_at
+    if expires_at is None:
+        return ""
+
+    current = now or datetime.now(timezone.utc)
+    remaining = expires_at - current
+    remaining_seconds = remaining.total_seconds()
+    if remaining_seconds <= 0:
+        return (
+            "Configured INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT is already in the past. "
+            "Replace INSTAGRAM_ACCESS_TOKEN with a fresh long-lived token."
+        )
+
+    if remaining_seconds > warning_days * 86400:
+        return ""
+
+    remaining_days = remaining_seconds / 86400
+    if remaining_days >= 1:
+        window = f"{remaining_days:.1f} days"
+    else:
+        remaining_hours = max(1.0, remaining_seconds / 3600)
+        window = f"{remaining_hours:.1f} hours"
+
+    return (
+        "Instagram access token expires soon "
+        f"({window} remaining, expires at {expires_at.isoformat()})."
+    )
+
+
+def instagram_token_time_remaining(
+    config: InstagramConfig,
+    *,
+    now: datetime | None = None,
+) -> timedelta | None:
+    """Return remaining time until the configured token expires."""
+    expires_at = config.access_token_expires_at
+    if expires_at is None:
+        return None
+    current = now or datetime.now(timezone.utc)
+    return expires_at - current
+
+
+def is_instagram_token_error_message(message: str) -> bool:
+    """Return True when an Instagram API error looks token-related."""
+    normalized = " ".join((message or "").lower().split())
+    if not normalized:
+        return False
+    indicators = (
+        "access token",
+        "validating access token",
+        "session has expired",
+        "invalid oauth access token",
+    )
+    return any(indicator in normalized for indicator in indicators)
+
+
+def instagram_token_error_guidance(message: str) -> str:
+    """Return concise remediation guidance for Instagram token failures."""
+    if is_instagram_token_error_message(message):
+        return (
+            "Replace INSTAGRAM_ACCESS_TOKEN in .env with a long-lived Instagram/Meta token, "
+            "update INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT if known, then restart the dashboard."
+        )
+    return "Review the Instagram configuration and API permissions, then retry."
+
+
+def clear_instagram_token_alert_state() -> None:
+    """Remove persisted Instagram token alert suppression state."""
+    try:
+        INSTAGRAM_TOKEN_ALERT_STATE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def should_send_instagram_token_expiry_alert(
+    config: InstagramConfig,
+    *,
+    threshold_days: int,
+    now: datetime | None = None,
+) -> bool:
+    """Return True when a proactive Instagram token-expiry alert should be sent."""
+    expires_at = config.access_token_expires_at
+    if expires_at is None:
+        return False
+
+    current = now or datetime.now(timezone.utc)
+    remaining = expires_at - current
+    if remaining.total_seconds() <= 0:
+        return False
+    if remaining.total_seconds() > threshold_days * 86400:
+        return False
+
+    try:
+        raw = json.loads(INSTAGRAM_TOKEN_EXPIRY_ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+
+    expires_key = expires_at.astimezone(timezone.utc).isoformat()
+    sent_thresholds_raw = raw.get(expires_key, [])
+    if isinstance(sent_thresholds_raw, list):
+        sent_thresholds = {int(item) for item in sent_thresholds_raw if str(item).strip()}
+    else:
+        sent_thresholds = set()
+    if threshold_days in sent_thresholds:
+        return False
+
+    sent_thresholds.add(threshold_days)
+    raw[expires_key] = sorted(sent_thresholds, reverse=True)
+    INSTAGRAM_TOKEN_EXPIRY_ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    INSTAGRAM_TOKEN_EXPIRY_ALERT_STATE_PATH.write_text(
+        json.dumps(raw, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
+def should_send_instagram_token_alert(
+    *,
+    context: str,
+    error_text: str,
+    cooldown_hours: int = 12,
+    now: datetime | None = None,
+) -> bool:
+    """Return True when an Instagram token alert should be sent."""
+    if not is_instagram_token_error_message(error_text):
+        return False
+
+    current = now or datetime.now(timezone.utc)
+    fingerprint = "instagram_token_error"
+
+    try:
+        raw = json.loads(INSTAGRAM_TOKEN_ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+
+    last_fingerprint = str(raw.get("fingerprint", "")).strip()
+    last_sent_raw = str(raw.get("sent_at", "")).strip()
+    last_sent: datetime | None = None
+    if last_sent_raw:
+        try:
+            last_sent = datetime.fromisoformat(last_sent_raw.replace("Z", "+00:00"))
+        except ValueError:
+            last_sent = None
+        if last_sent is not None and last_sent.tzinfo is None:
+            last_sent = last_sent.replace(tzinfo=timezone.utc)
+
+    if (
+        fingerprint == last_fingerprint
+        and last_sent is not None
+        and (current - last_sent).total_seconds() < cooldown_hours * 3600
+    ):
+        return False
+
+    INSTAGRAM_TOKEN_ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    INSTAGRAM_TOKEN_ALERT_STATE_PATH.write_text(
+        json.dumps(
+            {
+                "fingerprint": fingerprint,
+                "context": context,
+                "sent_at": current.astimezone(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
 def load_instagram_config(required: bool = False) -> InstagramConfig | None:
     """Load Instagram Graph configuration from environment variables."""
     load_dotenv()
     base_url = os.getenv("INSTAGRAM_BASE_URL", "https://graph.facebook.com").strip().rstrip("/")
     ig_user_id = os.getenv("INSTAGRAM_IG_USER_ID", "").strip()
     access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
+    access_token_expires_at = _parse_instagram_token_expiry(
+        os.getenv("INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT", "")
+    )
     api_version = os.getenv("INSTAGRAM_API_VERSION", "v23.0").strip().lstrip("/") or "v23.0"
 
     timeout_raw = os.getenv("INSTAGRAM_TIMEOUT_SECONDS", "30").strip()
@@ -78,6 +286,7 @@ def load_instagram_config(required: bool = False) -> InstagramConfig | None:
         base_url=base_url or "https://graph.facebook.com",
         ig_user_id=ig_user_id,
         access_token=access_token,
+        access_token_expires_at=access_token_expires_at,
         api_version=api_version,
         timeout_seconds=timeout_seconds,
         caption_max_chars=caption_max_chars,
@@ -135,7 +344,7 @@ class InstagramAdapter:
                     time.sleep(0.7 * (2**attempt))
                     continue
                 raise InstagramAPIError(
-                    f"Instagram request failed ({method} {path}): {exc}"
+                    f"Instagram request failed ({method} {path}): {_redact_access_token(str(exc))}"
                 ) from exc
 
             if (
@@ -176,7 +385,9 @@ class InstagramAdapter:
                 ) from exc
 
         if last_error is not None:
-            raise InstagramAPIError(f"Instagram request failed ({method} {path}): {last_error}")
+            raise InstagramAPIError(
+                f"Instagram request failed ({method} {path}): {_redact_access_token(str(last_error))}"
+            )
         raise InstagramAPIError(f"Instagram request failed ({method} {path}): unknown error")
 
     def verify_account(self) -> dict:

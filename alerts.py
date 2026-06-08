@@ -49,6 +49,22 @@ def is_fatal_openai_category(category: str) -> bool:
     return (category or "").strip().lower() in OPENAI_FATAL_CATEGORIES
 
 
+def openai_category_action_text(category: str) -> str:
+    """Return one operator-facing action line for an OpenAI failure category."""
+    normalized = (category or "").strip().lower()
+    if normalized == "quota_exhausted":
+        return "OpenAI API quota/billing appears exhausted. Top up API credits or fix billing, then retry."
+    if normalized == "auth_failed":
+        return "OpenAI authentication failed. Check the API key or related credentials, then retry."
+    if normalized == "rate_limited":
+        return "OpenAI rate limit hit. Wait and retry once the limit window clears."
+    if normalized == "safety_rejected":
+        return "OpenAI rejected the request on safety/policy grounds. Review the prompt and input content."
+    if normalized == "network_error":
+        return "OpenAI request looks like a network issue. Check connectivity and retry."
+    return "Review the error details and retry after fixing the underlying issue."
+
+
 @lru_cache(maxsize=1)
 def _slack_webhook_url() -> str:
     """Load Slack webhook URL from environment or .env."""
@@ -78,4 +94,3 @@ def send_slack_alert(title: str, message: str) -> bool:
     except requests.RequestException:
         return False
     return True
-

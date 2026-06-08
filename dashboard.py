@@ -21,8 +21,18 @@ import time
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
-from alerts import classify_openai_error_text, is_fatal_openai_category, send_slack_alert
+from alerts import (
+    classify_openai_error_text,
+    is_fatal_openai_category,
+    openai_category_action_text,
+    send_slack_alert,
+)
 from persona import get_persona_state
+from social.instagram_adapter import (
+    instagram_token_time_remaining,
+    load_instagram_config,
+    should_send_instagram_token_expiry_alert,
+)
 from slack_control import PID_PATH as SLACK_CONTROL_PID_PATH
 from storage import init_storage, list_published_posts
 
@@ -52,6 +62,7 @@ PLATFORM_DISPLAY_NAMES = {
     "wordpress": "WordPress",
     "instagram": "Instagram",
 }
+INSTAGRAM_TOKEN_WARNING_DAYS = (7, 3, 1)
 
 
 @dataclass
@@ -106,6 +117,7 @@ GENERATE_START_TIME = ""
 SCHED_STOP_PREFIX = "__SCHED_STOP__:"
 SLACK_CONTROL_LAST_RESULT = ""
 LAST_GENERATE_MISS_ALERT_KEY = ""
+GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS = False
 
 
 def _validate_generate_interval_seconds(value: int) -> int:
@@ -244,6 +256,8 @@ def _load_scheduler_preferences() -> dict[str, object]:
         "mentions_interval_seconds": 300,
         "active_publish_platforms": list(DEFAULT_ACTIVE_PUBLISH_PLATFORMS),
         "active_mention_platforms": list(DEFAULT_ACTIVE_MENTION_PLATFORMS),
+        "last_generate_miss_alert_key": "",
+        "generate_miss_alert_blocked_until_success": False,
     }
     try:
         raw = json.loads(SCHED_PREFS_PATH.read_text(encoding="utf-8"))
@@ -287,6 +301,15 @@ def _load_scheduler_preferences() -> dict[str, object]:
                 raw.get("active_publish_platforms", defaults["active_mention_platforms"]),
             )
         ),
+        "last_generate_miss_alert_key": str(
+            raw.get("last_generate_miss_alert_key", defaults["last_generate_miss_alert_key"])
+        ).strip(),
+        "generate_miss_alert_blocked_until_success": bool(
+            raw.get(
+                "generate_miss_alert_blocked_until_success",
+                defaults["generate_miss_alert_blocked_until_success"],
+            )
+        ),
     }
 
 
@@ -298,6 +321,10 @@ def _save_scheduler_preferences() -> None:
         "mentions_interval_seconds": int(SCHEDULERS["mentions"].interval_seconds),
         "active_publish_platforms": list(ACTIVE_PUBLISH_PLATFORMS),
         "active_mention_platforms": list(ACTIVE_MENTION_PLATFORMS),
+        "last_generate_miss_alert_key": str(LAST_GENERATE_MISS_ALERT_KEY),
+        "generate_miss_alert_blocked_until_success": bool(
+            GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS
+        ),
     }
     SCHED_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SCHED_PREFS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -306,10 +333,14 @@ def _save_scheduler_preferences() -> None:
 def _apply_scheduler_preferences() -> None:
     """Apply persisted preferences to in-memory scheduler defaults."""
     prefs = _load_scheduler_preferences()
-    global GENERATE_START_TIME
+    global GENERATE_START_TIME, LAST_GENERATE_MISS_ALERT_KEY, GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS
     SCHEDULERS["generate_publish"].interval_seconds = int(prefs["generate_publish_interval_seconds"])
     GENERATE_START_TIME = _normalize_generate_start_time(prefs.get("generate_start_time"))
     SCHEDULERS["mentions"].interval_seconds = int(prefs["mentions_interval_seconds"])
+    LAST_GENERATE_MISS_ALERT_KEY = str(prefs.get("last_generate_miss_alert_key", "")).strip()
+    GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS = bool(
+        prefs.get("generate_miss_alert_blocked_until_success", False)
+    )
     ACTIVE_PUBLISH_PLATFORMS.clear()
     ACTIVE_PUBLISH_PLATFORMS.extend(
         _normalize_active_publish_platforms(prefs.get("active_publish_platforms"))
@@ -708,6 +739,7 @@ def _build_actions() -> dict[str, tuple[str, Callable[[dict[str, str]], list[str
 
 def _run_generate_publish_cycle() -> str:
     """Run one scheduled cycle: generate post(s) then publish new runs in order."""
+    global GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS
     manifest_file = tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".txt",
@@ -726,6 +758,7 @@ def _run_generate_publish_cycle() -> str:
     try:
         if gen_job.status != "succeeded":
             category = classify_openai_error_text(gen_job.output or "")
+            action_text = openai_category_action_text(category)
             output_excerpt = " ".join((gen_job.output or "").strip().split())[-600:] or "N/A"
             base_message = (
                 f"main.py failed (rc={gen_job.return_code}, "
@@ -736,6 +769,7 @@ def _run_generate_publish_cycle() -> str:
                 message=(
                     f"Job: `Scheduled Generate Post`\n"
                     f"Category: `{category}`\n"
+                    f"Action: {action_text}\n"
                     f"Return code: `{gen_job.return_code}`\n"
                     f"Output excerpt: `{output_excerpt}`"
                 ),
@@ -747,7 +781,8 @@ def _run_generate_publish_cycle() -> str:
                         "Generate + Publish halted due to fatal OpenAI error category.\n"
                         f"Category: `{category}`\n"
                         f"Job: `Scheduled Generate Post`\n"
-                        "Action: scheduler stopped; intervention required."
+                        f"Action: {action_text}\n"
+                        "Scheduler state: stopped until manually restarted."
                     ),
                 )
                 return f"{SCHED_STOP_PREFIX}{base_message} Scheduler auto-stopped."
@@ -786,6 +821,10 @@ def _run_generate_publish_cycle() -> str:
                 published += 1
             else:
                 publish_failed += 1
+
+        with SCHED_LOCK:
+            GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS = False
+            _save_scheduler_preferences()
 
         return (
             f"generated_runs={len(created)} platform={platform_arg} "
@@ -877,6 +916,9 @@ def _scheduler_loop(
 
     while not stop_event.is_set():
         with SCHED_LOCK:
+            scheduled_run_at = _parse_local_stamp(state.next_run_at) or _now_dt()
+
+        with SCHED_LOCK:
             state.last_run_at = _now_stamp()
             state.last_result = "running..."
             state.next_run_at = ""
@@ -899,12 +941,25 @@ def _scheduler_loop(
                 state.running = False
                 state.next_run_at = ""
             else:
-                state.next_run_at = _future_stamp(state.interval_seconds)
+                next_run_dt = scheduled_run_at + timedelta(seconds=state.interval_seconds)
+                now_local = _now_dt()
+                while next_run_dt <= now_local:
+                    next_run_dt += timedelta(seconds=state.interval_seconds)
+                state.next_run_at = _stamp_from_dt(next_run_dt)
 
         if stop_requested:
             break
 
-        if stop_event.wait(state.interval_seconds):
+        next_run_dt = _parse_local_stamp(state.next_run_at)
+        if next_run_dt is None:
+            wait_seconds = state.interval_seconds
+        else:
+            wait_seconds = max(
+                0,
+                int(math.ceil((next_run_dt - _now_dt()).total_seconds())),
+            )
+
+        if stop_event.wait(wait_seconds):
             break
 
     with SCHED_LOCK:
@@ -988,12 +1043,14 @@ def _scheduler_snapshot() -> dict[str, dict[str, str | int | bool]]:
 
 def _send_generate_miss_alert(expected_run_dt: datetime, last_seen: str, context: str) -> None:
     """Send one Slack alert for a missed scheduled generate run."""
-    global LAST_GENERATE_MISS_ALERT_KEY
+    global LAST_GENERATE_MISS_ALERT_KEY, GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS
     alert_key = expected_run_dt.strftime("%Y-%m-%d %H:%M:%S")
+    if GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS:
+        return
     if LAST_GENERATE_MISS_ALERT_KEY == alert_key:
         return
     active_platforms = _platforms_display_label(_get_active_publish_platforms())
-    send_slack_alert(
+    alert_sent = send_slack_alert(
         title="Copierbot scheduled generation missed",
         message=(
             f"Expected run: `{alert_key}` local\n"
@@ -1003,7 +1060,12 @@ def _send_generate_miss_alert(expected_run_dt: datetime, last_seen: str, context
             f"Context: {context}"
         ),
     )
-    LAST_GENERATE_MISS_ALERT_KEY = alert_key
+    if not alert_sent:
+        return
+    with SCHED_LOCK:
+        LAST_GENERATE_MISS_ALERT_KEY = alert_key
+        GENERATE_MISS_ALERT_BLOCKED_UNTIL_SUCCESS = True
+        _save_scheduler_preferences()
 
 
 def _maybe_alert_if_generate_already_missed_before_startup() -> None:
@@ -1054,11 +1116,54 @@ def _maybe_alert_on_missed_generate_run() -> None:
             state.last_result = f"alerted: missed scheduled generate run due at {_stamp_from_dt(next_run_dt)} local."
 
 
+def _maybe_alert_on_instagram_token_expiry() -> None:
+    """Send one Slack alert at 7/3/1-day thresholds before Instagram token expiry."""
+    instagram_config = load_instagram_config(required=False)
+    if instagram_config is None or instagram_config.access_token_expires_at is None:
+        return
+
+    remaining = instagram_token_time_remaining(instagram_config)
+    if remaining is None or remaining.total_seconds() <= 0:
+        return
+
+    remaining_days = remaining.total_seconds() / 86400
+    for threshold_days in INSTAGRAM_TOKEN_WARNING_DAYS:
+        if remaining_days > threshold_days:
+            continue
+        if not should_send_instagram_token_expiry_alert(
+            instagram_config,
+            threshold_days=threshold_days,
+        ):
+            continue
+
+        expires_at = instagram_config.access_token_expires_at.astimezone(timezone.utc).isoformat()
+        if remaining_days >= 1:
+            remaining_label = f"{remaining_days:.1f} days"
+        else:
+            remaining_label = f"{max(1.0, remaining.total_seconds() / 3600):.1f} hours"
+        threshold_label = f"{threshold_days} day" if threshold_days == 1 else f"{threshold_days} days"
+        send_slack_alert(
+            title="Copierbot Instagram token expiring soon",
+            message=(
+                f"Threshold: `{threshold_label}`\n"
+                f"Remaining: `{remaining_label}`\n"
+                f"Expires at: `{expires_at}`\n"
+                "Action: Generate a fresh long-lived Instagram token, update "
+                "`INSTAGRAM_ACCESS_TOKEN` and `INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT`, then restart the dashboard."
+            ),
+        )
+        break
+
+
 def _scheduler_watchdog_loop() -> None:
     """Background watchdog for alerting on missed scheduled generate runs."""
     while True:
         try:
             _maybe_alert_on_missed_generate_run()
+        except Exception:
+            pass
+        try:
+            _maybe_alert_on_instagram_token_expiry()
         except Exception:
             pass
         time.sleep(60)
@@ -1809,6 +1914,7 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 def run_server() -> None:
     """Run local-only dashboard server."""
     _maybe_alert_if_generate_already_missed_before_startup()
+    _maybe_alert_on_instagram_token_expiry()
     _start_generate_scheduler_from_settings()
     _start_mentions_scheduler_from_settings()
     _start_slack_control_listener()

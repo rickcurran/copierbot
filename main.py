@@ -11,7 +11,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from article_context import build_article_context, fetch_article_seed
-from alerts import classify_openai_error_text, send_slack_alert
+from alerts import classify_openai_error_text, openai_category_action_text, send_slack_alert
 from ascii_fallback import create_ascii_fallback_image
 from anonymize import anonymize_headline_names
 from caption import generate_caption
@@ -29,6 +29,51 @@ from title_gen import generate_title
 
 
 OUTPUT_DIR = Path("output")
+
+
+def _publishable_run_dirs_newest_first(limit: int = 10) -> list[Path]:
+    """Return recent timestamped output folders, newest first."""
+    if not OUTPUT_DIR.exists():
+        return []
+    candidates = [
+        path
+        for path in OUTPUT_DIR.iterdir()
+        if path.is_dir() and path.name[:4].isdigit() and path.name[4:5] == "-"
+    ]
+    return sorted(candidates, key=lambda path: path.name, reverse=True)[: max(0, int(limit))]
+
+
+def _run_dir_post_type(run_dir: Path) -> str:
+    """Infer post type from files present in one output folder."""
+    has_system_log = any(
+        path.is_file() and path.name.startswith("system_log  ") and path.suffix.lower() == ".txt"
+        for path in run_dir.iterdir()
+    )
+    has_news_artifacts = any(
+        path.is_file()
+        and (
+            path.name.startswith("caption  ")
+            or path.name.startswith("prompt  ")
+            or path.name.startswith("image  ")
+        )
+        for path in run_dir.iterdir()
+    )
+    if has_system_log and not has_news_artifacts:
+        return "system_log"
+    if has_news_artifacts:
+        return "news"
+    return "unknown"
+
+
+def _recent_system_log_streak(limit: int = 5) -> int:
+    """Return consecutive system-log-only run count from newest backwards."""
+    streak = 0
+    for run_dir in _publishable_run_dirs_newest_first(limit=limit):
+        post_type = _run_dir_post_type(run_dir)
+        if post_type != "system_log":
+            break
+        streak += 1
+    return streak
 
 
 def get_generation_char_limit(settings) -> int:
@@ -78,6 +123,8 @@ def build_output_paths() -> tuple[Path, Path, Path, Path, str]:
 
 def choose_post_type() -> str:
     """Choose post type with 80/20 weighting (news/system_log)."""
+    if _recent_system_log_streak(limit=5) >= 2:
+        return "news"
     return "system_log" if random.random() < 0.2 else "news"
 
 
@@ -318,8 +365,16 @@ def run(run_manifest_path: Path | None = None, article_url: str = "") -> None:
             post_type = "news"
             logging.info("Selected post type: %s (forced by manual article URL)", post_type)
         else:
+            recent_system_log_streak = _recent_system_log_streak(limit=5)
             post_type = choose_post_type()
-            logging.info("Selected post type: %s", post_type)
+            if post_type == "news" and recent_system_log_streak >= 2:
+                logging.info(
+                    "Selected post type: %s (forced after %d consecutive system-log runs)",
+                    post_type,
+                    recent_system_log_streak,
+                )
+            else:
+                logging.info("Selected post type: %s", post_type)
         if post_type == "system_log":
             run_system_log_post(
                 client=client,
@@ -408,10 +463,12 @@ def run(run_manifest_path: Path | None = None, article_url: str = "") -> None:
             logging.error("Failed to write run failure details to %s", error_path)
 
         category = classify_openai_error_text(f"{exc}\n{traceback_text}")
+        action_text = openai_category_action_text(category)
         alert_sent = send_slack_alert(
             title="Copierbot generation failed",
             message=(
                 f"Category: `{category}`\n"
+                f"Action: {action_text}\n"
                 f"Run folder: `{run_dir_path}`\n"
                 f"Error file: `{error_path.name}`\n"
                 f"Error: {str(exc).strip() or 'unknown error'}"
