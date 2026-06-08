@@ -8,6 +8,13 @@ logs/
 *.log
 data/bluesky_session.json
 data/slack_control.pid
+data/copierbot.db
+data/bluesky_mention_cursor.json
+data/mention_cursor.json
+data/wordpress_comment_cursor.json
+data/dashboard_scheduler_state.json
+data/persona_state.json
 data/instagram_token_alert_state.json
 data/instagram_token_expiry_alert_state.json
 copierbot-run-manifest-*.txt
+social/__pycache__/

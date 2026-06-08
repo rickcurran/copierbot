@@ -131,16 +131,16 @@ Expected boot/login flow currently used:
 - LaunchAgent/login item starts `run-copierbot-dashboard.sh`.
 - Dashboard boots and auto-starts both schedulers.
 
-Script path in use:
+Launcher script path in use on the current machine:
 
-- `/Users/rickcurran/bin/run-copierbot-dashboard.sh`
+- `<user-bin>/run-copierbot-dashboard.sh`
 
-Script contents should be:
+Launcher contents should be equivalent to:
 
 ```zsh
 #!/bin/zsh
-cd /Users/rickcurran/GitHub/copierbot
-exec /Users/rickcurran/GitHub/copierbot/.venv/bin/python dashboard.py
+cd <repo-root>
+exec <repo-root>/.venv/bin/python dashboard.py
 ```
 
 ## 7) Secrets and Git Hygiene
