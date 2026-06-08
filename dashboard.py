@@ -41,6 +41,7 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 SCHED_PREFS_PATH = BASE_DIR / "data" / "dashboard_scheduler_state.json"
 MAX_JOBS = 80
+JOB_RENDER_LIMIT = 24
 MAX_OUTPUT_CHARS = 12000
 HOST = "127.0.0.1"
 PORT = 8787
@@ -63,6 +64,7 @@ PLATFORM_DISPLAY_NAMES = {
     "instagram": "Instagram",
 }
 INSTAGRAM_TOKEN_WARNING_DAYS = (7, 3, 1)
+ICON_PATH = BASE_DIR / "image.png"
 
 
 @dataclass
@@ -1299,6 +1301,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/image.png":
+            self._serve_static_file(ICON_PATH, "image/png")
+            return
         if parsed.path != "/":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -1309,6 +1314,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path != "/run":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
+        wants_async = self.headers.get("X-Requested-With", "").lower() == "fetch"
 
         length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(length).decode("utf-8", errors="replace")
@@ -1319,16 +1325,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if action == "update_publish_platforms":
             selected = form.get("publish_platform", [])
             _set_active_publish_platforms([str(item) for item in selected])
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.end_headers()
+            self._finish_post_response(wants_async)
             return
         if action == "update_mention_platforms":
             selected = form.get("mention_platform", [])
             _set_active_mention_platforms([str(item) for item in selected])
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.end_headers()
+            self._finish_post_response(wants_async)
             return
 
         actions = _build_actions()
@@ -1362,13 +1364,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif action == "stop_slack_control":
             _stop_slack_control_listener()
 
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", "/")
-        self.end_headers()
+        self._finish_post_response(wants_async)
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         """Silence default HTTP request logging for cleaner terminal output."""
         return
+
+    def _finish_post_response(self, wants_async: bool) -> None:
+        """Return either no-content for fetch callers or a redirect for normal forms."""
+        if wants_async:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def _serve_static_file(self, path: Path, content_type: str) -> None:
+        """Serve one known local static file."""
+        if not path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        payload = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _render_index(self) -> None:
         runs = _list_run_dirs()
@@ -1385,18 +1408,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
         sched = _scheduler_snapshot()
         with JOB_LOCK:
-            jobs = list(reversed(JOBS))
+            all_jobs = list(reversed(JOBS))
+        jobs = all_jobs[:JOB_RENDER_LIMIT]
+        total_jobs = len(all_jobs)
 
-        last_job = jobs[0] if jobs else None
+        last_job = all_jobs[0] if all_jobs else None
         alert_html = ""
         if last_job:
             last_suffix = ""
+            alert_class = "alert-neutral"
             if last_job.status == "failed":
                 failure_summary = _video_failure_summary(last_job)
                 if failure_summary:
                     last_suffix = f" - {html.escape(failure_summary)}"
+                alert_class = "alert-failed"
+            elif last_job.status == "succeeded":
+                alert_class = "alert-succeeded"
+            elif last_job.status == "running":
+                alert_class = "alert-running"
             alert_html = (
-                f"<div class='alert'>Last job: #{last_job.job_id} {html.escape(last_job.label)} "
+                f"<div class='alert {alert_class}'>Last job: #{last_job.job_id} {html.escape(last_job.label)} "
                 f"[{html.escape(last_job.status)}]{last_suffix}</div>"
             )
 
@@ -1407,6 +1438,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             run_options = "<option value=''>No run folders yet</option>"
 
         job_cards = "\n".join(_render_job_card(job) for job in jobs) or "<p>No jobs yet.</p>"
+        job_count_label = (
+            f"Showing latest {len(jobs)} of {total_jobs}"
+            if total_jobs > len(jobs)
+            else f"{total_jobs} total"
+        )
 
         gp = sched["generate_publish"]
         mn = sched["mentions"]
@@ -1467,13 +1503,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
   <title>Copierbot Dashboard</title>
   <style>
     :root {{
-      --bg: #f4f0e9;
-      --ink: #1e1f22;
-      --accent: #0f766e;
-      --accent2: #9a3412;
-      --card: #ffffff;
-      --border: #d8d2c5;
-      --muted: #6b7280;
+      --bg: #f4efe8;
+      --ink: #2d2928;
+      --card: #fffaf2;
+      --card-strong: #fffdf8;
+      --border: #d7cec2;
+      --muted: #6d6761;
+      --accent: #5fa8b4;
+      --accent-deep: #3d8895;
+      --accent2: #c36b97;
+      --accent3: #d8b74d;
+      --accent4: #342b2e;
+      --success: #3c7f62;
+      --warning: #a96836;
+      --danger: #b14949;
+      --shadow: 0 12px 34px rgba(52, 43, 46, 0.08);
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -1481,149 +1525,342 @@ class DashboardHandler(BaseHTTPRequestHandler):
       font-family: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
       color: var(--ink);
       background:
-        radial-gradient(circle at 10% 20%, #efe6d4 0%, transparent 35%),
-        radial-gradient(circle at 90% 10%, #d9efe6 0%, transparent 40%),
-        var(--bg);
+        radial-gradient(circle at 8% 12%, rgba(95, 168, 180, 0.15) 0%, transparent 30%),
+        radial-gradient(circle at 90% 10%, rgba(195, 107, 151, 0.10) 0%, transparent 28%),
+        linear-gradient(180deg, #faf5ec 0%, var(--bg) 36%, #f2ece3 100%);
       min-height: 100vh;
     }}
     .wrap {{
       width: min(96vw, 1920px);
       max-width: none;
       margin: 0 auto;
-      padding: 1.1rem 1.4rem 1.6rem;
+      padding: 1.15rem 1.4rem 1.8rem;
     }}
-    h1 {{ margin: 0 0 0.7rem; font-size: 1.6rem; letter-spacing: 0.01em; }}
-    h2 {{ margin: 0 0 0.55rem; font-size: 1rem; }}
-    .sub {{ margin: 0 0 1rem; color: var(--muted); font-size: 0.95rem; }}
+    .dashboard-shell {{
+      display: grid;
+      gap: 1rem;
+    }}
+    .hero {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 1rem;
+      align-items: center;
+      background:
+        linear-gradient(90deg,
+          rgba(95, 168, 180, 0.14) 0 23%,
+          rgba(195, 107, 151, 0.11) 23% 49%,
+          rgba(216, 183, 77, 0.14) 49% 72%,
+          rgba(52, 43, 46, 0.10) 72% 100%
+        ),
+        var(--card-strong);
+      border: 1px solid rgba(215, 206, 194, 0.9);
+      border-radius: 18px;
+      padding: 1rem 1.1rem;
+      box-shadow: var(--shadow);
+    }}
+    .hero-copy {{
+      min-width: 0;
+    }}
+    h1 {{
+      margin: 0 0 0.45rem;
+      font-size: clamp(1.65rem, 2vw, 2.15rem);
+      letter-spacing: 0.01em;
+    }}
+    .sub {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.97rem;
+      line-height: 1.5;
+      max-width: 70ch;
+    }}
+    .hero-art {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding-left: 0.75rem;
+    }}
+    .hero-art img {{
+      width: 92px;
+      height: 92px;
+      object-fit: contain;
+      border-radius: 18px;
+      background: rgba(255, 250, 242, 0.86);
+      box-shadow: 0 12px 24px rgba(52, 43, 46, 0.12);
+    }}
     .toolbar {{
       display: flex;
-      gap: 0.5rem;
+      gap: 0.7rem;
       align-items: center;
-      margin: 0 0 0.9rem;
       flex-wrap: wrap;
+      margin-top: 0.9rem;
     }}
     .toolbar button {{
       width: auto;
-      min-width: 110px;
+      min-width: 124px;
     }}
     .toolbar label {{
-      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.92rem;
       color: var(--muted);
     }}
-    .alert {{
+    .toolbar-meta {{
+      display: flex;
+      gap: 0.8rem;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    .auto-indicator {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.32rem 0.58rem;
+      border-radius: 999px;
       border: 1px solid var(--border);
-      background: #fffbe8;
-      border-left: 4px solid var(--accent2);
-      padding: 0.65rem 0.8rem;
-      margin-bottom: 1rem;
-      border-radius: 8px;
-      font-size: 0.95rem;
+      background: rgba(255,255,255,0.55);
+    }}
+    .auto-indicator::before {{
+      content: "";
+      width: 0.56rem;
+      height: 0.56rem;
+      border-radius: 999px;
+      background: var(--warning);
+      box-shadow: 0 0 0 3px rgba(169, 104, 54, 0.12);
+    }}
+    .auto-indicator.on::before {{
+      background: var(--success);
+      box-shadow: 0 0 0 3px rgba(60, 127, 98, 0.12);
     }}
     .stats {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 0.55rem;
-      margin-bottom: 1rem;
+      gap: 0.6rem;
     }}
     .stat {{
-      background: var(--card);
+      background: rgba(255, 250, 242, 0.92);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 0.6rem 0.75rem;
+      border-radius: 14px;
+      padding: 0.72rem 0.82rem;
+      box-shadow: 0 5px 14px rgba(52, 43, 46, 0.05);
     }}
-    .stat .k {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }}
-    .stat .v {{ font-size: 1rem; font-weight: 700; margin-top: 0.1rem; }}
+    .stat .k {{
+      color: var(--muted);
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .stat .v {{
+      font-size: 1rem;
+      font-weight: 700;
+      margin-top: 0.14rem;
+    }}
+    .alert {{
+      border: 1px solid rgba(95, 168, 180, 0.18);
+      background: rgba(252, 250, 246, 0.95);
+      border-left: 4px solid rgba(95, 168, 180, 0.72);
+      padding: 0.72rem 0.86rem;
+      border-radius: 12px;
+      font-size: 0.94rem;
+      box-shadow: 0 8px 20px rgba(52, 43, 46, 0.05);
+    }}
+    .alert-succeeded {{
+      border-color: rgba(60, 127, 98, 0.22);
+      border-left-color: var(--success);
+      background: rgba(244, 251, 246, 0.96);
+    }}
+    .alert-failed {{
+      border-color: rgba(177, 73, 73, 0.22);
+      border-left-color: var(--danger);
+      background: rgba(255, 245, 245, 0.96);
+    }}
+    .alert-running {{
+      border-color: rgba(61, 136, 149, 0.22);
+      border-left-color: var(--accent-deep);
+      background: rgba(244, 250, 251, 0.96);
+    }}
+    .alert-neutral {{
+      border-color: rgba(109, 103, 97, 0.18);
+      border-left-color: rgba(109, 103, 97, 0.55);
+      background: rgba(252, 250, 246, 0.95);
+    }}
     .grid {{
       display: grid;
-      gap: 0.9rem;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.95rem;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       align-items: stretch;
     }}
     .compact-grid {{
       display: flex;
-      gap: 0.9rem;
+      gap: 0.95rem;
       flex-wrap: wrap;
       align-items: stretch;
     }}
     .compact-grid > .card {{
-      flex: 0 1 calc(25% - 0.7rem);
-      max-width: calc(25% - 0.7rem);
+      flex: 0 1 calc(25% - 0.72rem);
+      max-width: calc(25% - 0.72rem);
       min-width: 220px;
     }}
     .card {{
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 0.9rem;
-      box-shadow: 0 3px 10px rgba(0,0,0,0.04);
+      border-radius: 14px;
+      padding: 0.95rem;
+      box-shadow: var(--shadow);
       height: 100%;
     }}
-    .hint {{ margin: 0 0 0.6rem; color: var(--muted); font-size: 0.86rem; line-height: 1.3; }}
-    .sched-meta {{ margin: 0.25rem 0; color: var(--muted); font-size: 0.84rem; line-height: 1.35; }}
-    .sched-status {{ font-weight: 700; font-size: 0.8rem; text-transform: uppercase; }}
-    .sched-status.running {{ color: #166534; }}
-    .sched-status.stopped {{ color: #7c2d12; }}
+    .hint {{
+      margin: 0 0 0.65rem;
+      color: var(--muted);
+      font-size: 0.86rem;
+      line-height: 1.35;
+    }}
+    .sched-meta {{
+      margin: 0.26rem 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.35;
+    }}
+    .sched-status {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-weight: 700;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding: 0.28rem 0.55rem;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.7);
+      border: 1px solid var(--border);
+    }}
+    .sched-status::before {{
+      content: "";
+      width: 0.52rem;
+      height: 0.52rem;
+      border-radius: 999px;
+      background: var(--warning);
+    }}
+    .sched-status.running {{ color: var(--success); }}
+    .sched-status.running::before {{ background: var(--success); }}
+    .sched-status.stopped {{ color: var(--warning); }}
     form {{ margin: 0; }}
-    .inline {{ display: flex; gap: 0.45rem; align-items: center; margin-bottom: 0.5rem; }}
     button {{
       width: 100%;
       border: none;
       border-radius: 10px;
-      background: linear-gradient(145deg, var(--accent), #115e59);
+      background: linear-gradient(145deg, var(--accent), var(--accent-deep));
       color: #fff;
-      padding: 0.62rem 0.78rem;
+      padding: 0.66rem 0.8rem;
       font-weight: 600;
       cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease, opacity 120ms ease;
     }}
-    button.stop {{ background: linear-gradient(145deg, #9a3412, #7c2d12); }}
-    button:hover {{ filter: brightness(1.05); }}
-    select {{
+    button.stop {{
+      background: linear-gradient(145deg, #b46d47, #95563a);
+    }}
+    button:hover {{
+      filter: brightness(1.04);
+      transform: translateY(-1px);
+    }}
+    button:disabled {{
+      opacity: 0.7;
+      cursor: progress;
+      transform: none;
+    }}
+    select,
+    input[type="time"],
+    input[type="url"] {{
       width: 100%;
       margin-bottom: 0.5rem;
-      padding: 0.5rem;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: #fff;
-    }}
-    input[type="time"], input[type="url"] {{
-      width: 100%;
-      margin-bottom: 0.5rem;
-      padding: 0.5rem;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: #fff;
-    }}
-    .jobs {{ margin-top: 1rem; }}
-    .job {{
-      background: var(--card);
-      border: 1px solid var(--border);
+      padding: 0.56rem 0.6rem;
       border-radius: 10px;
-      margin-bottom: 0.75rem;
-      padding: 0.75rem;
+      border: 1px solid var(--border);
+      background: #fffdf9;
+      color: var(--ink);
     }}
-    .meta {{ color: var(--muted); font-size: 0.85rem; }}
-    .error-meta {{ color: #b91c1c; font-weight: 600; }}
-    .status {{ font-weight: 700; text-transform: uppercase; font-size: 0.8rem; }}
-    .status.running {{ color: #0f766e; }}
-    .status.failed {{ color: #b91c1c; }}
-    .status.succeeded {{ color: #166534; }}
-    .status.queued {{ color: #7c2d12; }}
+    .status-board {{
+      display: grid;
+      gap: 0.95rem;
+      grid-template-columns: minmax(0, 1fr);
+    }}
+    .status-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+      align-items: baseline;
+      flex-wrap: wrap;
+      margin-bottom: 0.7rem;
+    }}
+    .status-count {{
+      color: var(--muted);
+      font-size: 0.84rem;
+    }}
+    .jobs-panel {{
+      max-height: 450px;
+      overflow-y: auto;
+      padding-right: 0.2rem;
+    }}
+    .jobs-panel::-webkit-scrollbar {{
+      width: 0.7rem;
+    }}
+    .jobs-panel::-webkit-scrollbar-thumb {{
+      background: rgba(95, 168, 180, 0.32);
+      border-radius: 999px;
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }}
+    .job {{
+      background: rgba(255, 253, 248, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 0.75rem;
+      padding: 0.8rem;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 0.85rem;
+    }}
+    .error-meta {{
+      color: var(--danger);
+      font-weight: 600;
+    }}
+    .status {{
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: 0.8rem;
+    }}
+    .status.running {{ color: var(--accent-deep); }}
+    .status.failed {{ color: var(--danger); }}
+    .status.succeeded {{ color: var(--success); }}
+    .status.queued {{ color: var(--warning); }}
     pre {{
       margin: 0.5rem 0 0;
-      background: #111827;
-      color: #e5e7eb;
-      padding: 0.7rem;
-      border-radius: 8px;
+      background: #211d1f;
+      color: #eee7dd;
+      padding: 0.72rem;
+      border-radius: 9px;
       overflow-x: auto;
       white-space: pre-wrap;
       word-break: break-word;
       font-size: 0.8rem;
       max-height: 280px;
     }}
+    @media (max-width: 900px) {{
+      .hero {{
+        grid-template-columns: 1fr;
+      }}
+      .hero-art {{
+        justify-content: flex-start;
+        padding-left: 0;
+      }}
+    }}
     @media (max-width: 720px) {{
       .wrap {{
         width: 100%;
-        padding: 0.9rem;
+        padding: 0.95rem;
       }}
       .grid {{
         grid-template-columns: 1fr;
@@ -1636,48 +1873,64 @@ class DashboardHandler(BaseHTTPRequestHandler):
         max-width: none;
         min-width: 0;
       }}
+      .jobs-panel {{
+        max-height: none;
+      }}
     }}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Copierbot Local Dashboard</h1>
-    <p class="sub">Local-only controls bound to 127.0.0.1.</p>
-    <div class="toolbar">
-      <button id="refresh-now" type="button">Refresh Now</button>
-      <label>
-        <input id="auto-refresh" type="checkbox" />
-        Auto refresh (15s)
-      </label>
-      <span class="meta">Status: <strong id="auto-status">Off</strong></span>
-    </div>
+    <div id="dashboard-shell" class="dashboard-shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <h1>Copierbot Local Dashboard</h1>
+          <p class="sub">Local-only controls for generation, publishing, mention replies, Slack control, and video creation on <code>127.0.0.1</code>.</p>
+          <div class="toolbar">
+            <button id="refresh-now" type="button">Refresh Status</button>
+            <label>
+              <input id="auto-refresh" type="checkbox" />
+              Auto refresh
+            </label>
+            <div class="toolbar-meta">
+              <span id="auto-indicator" class="auto-indicator">
+                <strong id="auto-status">Off</strong>
+              </span>
+              <span>Polling interval: 15s</span>
+            </div>
+          </div>
+        </div>
+        <div class="hero-art">
+          <img src="/image.png" alt="Copierbot icon" />
+        </div>
+      </section>
 
-    <div class="stats">
-      <div class="stat">
-        <div class="k">Posts Generated</div>
-        <div class="v">{int(persona_state["posts_generated"])}</div>
+      <div class="stats">
+        <div class="stat">
+          <div class="k">Posts Generated</div>
+          <div class="v">{int(persona_state["posts_generated"])}</div>
+        </div>
+        <div class="stat">
+          <div class="k">Persona Phase</div>
+          <div class="v">{html.escape(str(persona_state["phase"]).upper())}</div>
+        </div>
+        <div class="stat">
+          <div class="k">Next Major Phase In</div>
+          <div class="v">{20 - (int(persona_state["posts_generated"]) % 20) if str(persona_state["phase"]) != "self_aware" else 0}</div>
+        </div>
+        <div class="stat">
+          <div class="k">Seasonal Phase</div>
+          <div class="v">{html.escape(seasonal_phase_label)}</div>
+        </div>
+        <div class="stat">
+          <div class="k">Next Seasonal Shift In</div>
+          <div class="v">{int(next_seasonal_in)}</div>
+        </div>
       </div>
-      <div class="stat">
-        <div class="k">Persona Phase</div>
-        <div class="v">{html.escape(str(persona_state["phase"]).upper())}</div>
-      </div>
-      <div class="stat">
-        <div class="k">Next Major Phase In</div>
-        <div class="v">{20 - (int(persona_state["posts_generated"]) % 20) if str(persona_state["phase"]) != "self_aware" else 0}</div>
-      </div>
-      <div class="stat">
-        <div class="k">Seasonal Phase</div>
-        <div class="v">{html.escape(seasonal_phase_label)}</div>
-      </div>
-      <div class="stat">
-        <div class="k">Next Seasonal Shift In</div>
-        <div class="v">{int(next_seasonal_in)}</div>
-      </div>
-    </div>
 
-    {alert_html}
+      {alert_html}
 
-    <div class="grid">
+      <div class="grid">
       <div class="card">
         <h2>Publish Destinations</h2>
         <p class="hint">Choose active social platforms. Generate + Publish scheduler and manual publish actions will post to these destinations using one generated run.</p>
@@ -1842,9 +2095,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
       </div>
     </div>
 
-    <div class="jobs">
-      <h2>Recent Jobs</h2>
-      {job_cards}
+      <section class="status-board">
+        <div class="card">
+          <div class="status-head">
+            <h2>Recent Jobs</h2>
+            <div class="status-count">{html.escape(job_count_label)}</div>
+          </div>
+          <p class="hint">Live status updates refresh in place without a full page reload. Older jobs are kept in memory, while this panel shows the latest activity in a scrollable feed.</p>
+          <div id="jobs-panel" class="jobs-panel">{job_cards}</div>
+        </div>
+      </section>
     </div>
   </div>
   <script>
@@ -1852,23 +2112,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
       const autoRefreshKey = "copierbot_dashboard_auto_refresh";
       const publishRunKey = "copierbot_dashboard_publish_run_dir";
       const videoRunKey = "copierbot_dashboard_video_run_dir";
+      const articleUrlKey = "copierbot_dashboard_article_url";
       const intervalMs = 15000;
-      const refreshBtn = document.getElementById("refresh-now");
-      const checkbox = document.getElementById("auto-refresh");
-      const status = document.getElementById("auto-status");
-      const publishRunSelect = document.getElementById("publish-run-dir");
-      const videoRunSelect = document.getElementById("video-run-dir");
       let timer = null;
+      let refreshInFlight = false;
 
-      const restoreSelect = (selectEl, storageKey) => {{
-        if (!selectEl) return;
-        const saved = window.localStorage.getItem(storageKey);
-        if (saved && [...selectEl.options].some((option) => option.value === saved)) {{
-          selectEl.value = saved;
+      const shell = () => document.getElementById("dashboard-shell");
+      const statusLabel = () => document.getElementById("auto-status");
+      const indicator = () => document.getElementById("auto-indicator");
+      const checkbox = () => document.getElementById("auto-refresh");
+
+      const selectBindings = [
+        ["publish-run-dir", publishRunKey],
+        ["video-run-dir", videoRunKey],
+      ];
+
+      const restoreControlState = () => {{
+        for (const [id, storageKey] of selectBindings) {{
+          const selectEl = document.getElementById(id);
+          if (!selectEl) continue;
+          const saved = window.localStorage.getItem(storageKey);
+          if (saved && [...selectEl.options].some((option) => option.value === saved)) {{
+            selectEl.value = saved;
+          }}
+          selectEl.addEventListener("change", () => {{
+            window.localStorage.setItem(storageKey, selectEl.value || "");
+          }});
         }}
-        selectEl.addEventListener("change", () => {{
-          window.localStorage.setItem(storageKey, selectEl.value || "");
-        }});
+        const urlInput = document.querySelector('input[name="article_url"]');
+        if (urlInput) {{
+          const savedUrl = window.localStorage.getItem(articleUrlKey);
+          if (savedUrl && !urlInput.value) {{
+            urlInput.value = savedUrl;
+          }}
+          urlInput.addEventListener("input", () => {{
+            window.localStorage.setItem(articleUrlKey, urlInput.value || "");
+          }});
+        }}
       }};
 
       const apply = (enabled) => {{
@@ -1877,19 +2157,118 @@ class DashboardHandler(BaseHTTPRequestHandler):
           timer = null;
         }}
         if (enabled) {{
-          timer = window.setInterval(() => window.location.reload(), intervalMs);
-          status.textContent = "On (15s)";
+          timer = window.setInterval(() => {{
+            if (shouldDeferRefresh()) return;
+            refreshDashboard();
+          }}, intervalMs);
+          if (statusLabel()) statusLabel().textContent = "On";
+          if (indicator()) indicator().classList.add("on");
         }} else {{
-          status.textContent = "Off";
+          if (statusLabel()) statusLabel().textContent = "Off";
+          if (indicator()) indicator().classList.remove("on");
         }}
-        checkbox.checked = !!enabled;
+        if (checkbox()) checkbox().checked = !!enabled;
         window.localStorage.setItem(autoRefreshKey, enabled ? "1" : "0");
       }};
 
-      refreshBtn.addEventListener("click", () => window.location.reload());
-      checkbox.addEventListener("change", () => apply(checkbox.checked));
-      restoreSelect(publishRunSelect, publishRunKey);
-      restoreSelect(videoRunSelect, videoRunKey);
+      const shouldDeferRefresh = () => {{
+        const active = document.activeElement;
+        return !!active && active.matches("input, textarea, select");
+      }};
+
+      const snapshotScrollPositions = () => {{
+        const positions = {{}};
+        document.querySelectorAll("[id='jobs-panel']").forEach((node) => {{
+          positions[node.id] = node.scrollTop;
+        }});
+        return positions;
+      }};
+
+      const restoreScrollPositions = (positions) => {{
+        Object.entries(positions).forEach(([id, value]) => {{
+          const node = document.getElementById(id);
+          if (node) node.scrollTop = value;
+        }});
+      }};
+
+      const refreshDashboard = async () => {{
+        if (refreshInFlight) return;
+        refreshInFlight = true;
+        const scrollPositions = snapshotScrollPositions();
+        try {{
+          const response = await fetch("/", {{
+            headers: {{
+              "X-Requested-With": "fetch",
+              "Cache-Control": "no-cache",
+            }},
+          }});
+          if (!response.ok) {{
+            throw new Error(`refresh failed with status ${{response.status}}`);
+          }}
+          const text = await response.text();
+          const doc = new DOMParser().parseFromString(text, "text/html");
+          const nextShell = doc.getElementById("dashboard-shell");
+          if (!nextShell || !shell()) {{
+            throw new Error("dashboard shell missing in refresh response");
+          }}
+          shell().innerHTML = nextShell.innerHTML;
+          restoreControlState();
+          bindForms();
+          bindRefreshControls();
+          restoreScrollPositions(scrollPositions);
+          apply(window.localStorage.getItem(autoRefreshKey) === "1");
+        }} catch (error) {{
+          console.error(error);
+        }} finally {{
+          refreshInFlight = false;
+        }}
+      }};
+
+      const bindForms = () => {{
+        document.querySelectorAll('form[action="/run"]').forEach((form) => {{
+          form.addEventListener("submit", async (event) => {{
+            event.preventDefault();
+            const submitter = event.submitter;
+            if (submitter) submitter.disabled = true;
+            try {{
+              const body = new URLSearchParams(new FormData(form));
+              const response = await fetch(form.action, {{
+                method: "POST",
+                headers: {{
+                  "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                  "X-Requested-With": "fetch",
+                }},
+                body: body.toString(),
+              }});
+              if (!response.ok && response.status !== 204) {{
+                throw new Error(`action failed with status ${{response.status}}`);
+              }}
+              await refreshDashboard();
+            }} catch (error) {{
+              console.error(error);
+            }} finally {{
+              if (submitter) submitter.disabled = false;
+            }}
+          }}, {{ once: true }});
+        }});
+      }};
+
+      const bindRefreshControls = () => {{
+        const refreshBtn = document.getElementById("refresh-now");
+        const refreshToggle = checkbox();
+        if (refreshBtn) {{
+          refreshBtn.addEventListener("click", () => {{
+            refreshDashboard();
+          }}, {{ once: true }});
+        }}
+        if (refreshToggle) {{
+          refreshToggle.addEventListener("change", () => apply(refreshToggle.checked), {{ once: true }});
+        }}
+      }};
+
+      restoreControlState();
+      bindForms();
+      bindRefreshControls();
       apply(window.localStorage.getItem(autoRefreshKey) === "1");
     }})();
   </script>

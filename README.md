@@ -1,6 +1,10 @@
 # Copierbot
 
-Copierbot is a local Python CLI project that simulates an AI office photocopier generating surreal robot-themed art posts.
+Copierbot is a local Python automation and publishing system built around the persona of `Xerox 9000`, a mildly sentient office photocopier. It turns current news into surreal collage-style images, captions, and system-log posts, saves everything into timestamped run folders, and can publish the results across platforms such as Mastodon, Bluesky, WordPress, and Instagram.
+
+It also includes a local web dashboard for manual control and scheduling, mention and comment monitoring with in-character replies, Slack alerts and Slack-based control commands, optional video generation for finished runs, persona evolution across major and seasonal phases, and local quote-bank driven social responses. In practice, it acts as a small creative operations system rather than just a single image-generation script.
+
+When the dashboard is running, you can access it locally at `http://127.0.0.1:8787`.
 
 ## Handoff
 
