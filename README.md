@@ -13,6 +13,10 @@ Running `python main.py` now chooses a post type:
 1. `news` post (80% probability)
 2. `system_log` post (20% probability)
 
+Guardrail:
+
+- If the two most recent publishable runs were both `system_log`, Copierbot forces the next run back to `news` to avoid long system-log streaks.
+
 ### News post flow
 
 1. Fetch and filter headlines from NewsAPI.org
@@ -180,7 +184,8 @@ WORDPRESS_SITE_TIMEZONE=Europe/London
 INSTAGRAM_BASE_URL=https://graph.facebook.com
 INSTAGRAM_API_VERSION=v23.0
 INSTAGRAM_IG_USER_ID=your_instagram_professional_account_id
-INSTAGRAM_ACCESS_TOKEN=your_instagram_access_token_here
+INSTAGRAM_ACCESS_TOKEN=your_long_lived_instagram_access_token_here
+INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT=2026-08-01T12:00:00Z
 INSTAGRAM_TIMEOUT_SECONDS=30
 INSTAGRAM_CAPTION_MAX_CHARS=2200
 INSTAGRAM_COMMENT_TEXT_MAX_CHARS=1000
@@ -193,6 +198,12 @@ SLACK_CONTROL_ALLOWED_USER_IDS=U12345678
 
 `WORDPRESS_SITE_TIMEZONE` is optional but recommended when your site should
 follow a named zone such as `Europe/London`, including DST changes.
+
+For Instagram, use a long-lived Meta/Instagram token rather than a short-lived
+Explorer token. `INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT` is optional but recommended;
+if you set it when rotating the token, Copierbot can warn when the token is
+close to expiry. The dashboard watchdog will send one Slack warning when the
+configured expiry crosses the `7`, `3`, and `1` day remaining thresholds.
 
 Post length modes:
 
@@ -247,7 +258,8 @@ Notes:
 - Generate+Publish supports a local start-time selector (`HH:MM`); if that time has already passed today, first run starts tomorrow at that time.
 - If scheduled generation fails with a fatal OpenAI error category (`quota_exhausted` or `auth_failed`), the Generate+Publish scheduler auto-stops and requires manual restart after fixing credentials/billing.
 - Recent Jobs output auto-links URLs (for example Mastodon/Bluesky/WordPress/Instagram links) in job logs.
-- Slack Control can be launched manually from the dashboard and will reject duplicate starts using a local pid lock.
+- Slack Control auto-starts with the dashboard and also rejects duplicate starts using a local pid lock.
+- On a fresh dashboard state file, active publish platforms default to `Mastodon`, and active mention platforms default to `Mastodon, Bluesky`.
 
 ## Manual Higgsfield Video Generation
 
@@ -300,6 +312,12 @@ Behavior:
 
 - `main.py` sends a Slack alert when generation fails, including run folder and classified error category.
 - Scheduler sends an additional Slack alert when it auto-stops due to fatal OpenAI categories (`quota_exhausted`, `auth_failed`).
+- `orchestrator.py` sends Slack alerts for publish failures.
+- The dashboard watchdog sends Slack alerts for missed scheduled generations.
+- `generate_video.py` sends Slack alerts for video-generation failures.
+- `engage.py` sends Slack alerts when Copierbot posts a social reply.
+- Instagram token failures are alertable, with duplicate suppression.
+- The dashboard watchdog sends one proactive Instagram token-expiry alert at `7`, `3`, and `1` day remaining when `INSTAGRAM_ACCESS_TOKEN_EXPIRES_AT` is set.
 - If `SLACK_WEBHOOK_URL` is missing, alerts are silently skipped.
 
 ## Slack Control Listener
@@ -433,11 +451,13 @@ Behavior:
   - Bluesky: `data/bluesky_mention_cursor.json` (newest notification URI marker)
   - WordPress: `data/wordpress_comment_cursor.json` (highest seen comment id)
 - Instagram comment scans use the recently published Instagram post ids stored in SQLite (`published_posts`) and poll comments on those posts.
+- Check the configured Instagram token manually before relying on scheduled runs:
+  - `python instagram_token_check.py`
 - Stores mentions in SQLite and processes unhandled rows.
 - Wellbeing check-ins still use a local `system_log` style reply.
 - Additional identity/contact/memory/consciousness/command style prompts now use the local curated quote bank in `data/quote_bank.json`.
 - The current active bank uses Xerox 9000 native identity/transmission lines; film quote slots are scaffolded in the same file and can be enabled after manual review.
-- Other mentions are marked handled with `no_reply` so they are not repeatedly reprocessed.
+- Other non-empty mentions fall through to the `other_intrigue` category and still receive a local curated reply; only empty mentions are marked `no_reply`.
 - Replies are tracked in `replies` table and do not increment persona post count.
 - `engage.py` does not call OpenAI APIs (text or image).
 - Each sent mention reply is archived as a timestamped file under `output/mention_responses/`.
@@ -459,6 +479,9 @@ copierbot/
     dashboard.py
     engage.py
     orchestrator.py
+    slack_control.py
+    generate_video.py
+    instagram_token_check.py
     phase_event.py
     mention_archive.py
     article_context.py
@@ -466,12 +489,14 @@ copierbot/
     ascii_fallback.py
     persona.py
     system_log.py
+    system_log_card.py
     news.py
     creative.py
     image_gen.py
     caption.py
     title_gen.py
     anonymize.py
+    quote_bank.py
     social_image.py
     storage.py
     social/
