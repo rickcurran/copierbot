@@ -18,3 +18,4 @@ data/instagram_token_alert_state.json
 data/instagram_token_expiry_alert_state.json
 copierbot-run-manifest-*.txt
 social/__pycache__/
+output/**/error  *.txt
