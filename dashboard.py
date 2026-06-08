@@ -744,7 +744,6 @@ def _run_generate_publish_cycle() -> str:
         mode="w",
         suffix=".txt",
         prefix="copierbot-run-manifest-",
-        dir=str(BASE_DIR),
         delete=False,
     )
     manifest_path = Path(manifest_file.name)
