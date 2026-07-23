@@ -57,6 +57,7 @@ MENTION_PLATFORM_OPTIONS = ("mastodon", "bluesky", "wordpress", "instagram")
 DEFAULT_ACTIVE_PUBLISH_PLATFORMS = ["mastodon"]
 DEFAULT_ACTIVE_MENTION_PLATFORMS = ["mastodon", "bluesky"]
 GENERATE_MISS_GRACE_SECONDS = 20 * 60
+GENERATE_EARLY_RUN_TOLERANCE_SECONDS = 2 * 60
 PLATFORM_DISPLAY_NAMES = {
     "mastodon": "Mastodon",
     "bluesky": "Bluesky",
@@ -1079,7 +1080,10 @@ def _maybe_alert_if_generate_already_missed_before_startup() -> None:
     if now_local <= expected_today + timedelta(seconds=GENERATE_MISS_GRACE_SECONDS):
         return
     latest_run = _latest_generated_run_time()
-    if latest_run is not None and latest_run >= expected_today:
+    earliest_acceptable_run = expected_today - timedelta(
+        seconds=GENERATE_EARLY_RUN_TOLERANCE_SECONDS
+    )
+    if latest_run is not None and latest_run >= earliest_acceptable_run:
         return
     _send_generate_miss_alert(
         expected_run_dt=expected_today,
@@ -1686,6 +1690,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
       border-left-color: rgba(109, 103, 97, 0.55);
       background: rgba(252, 250, 246, 0.95);
     }}
+    .action-feedback {{
+      display: none;
+      border: 1px solid rgba(95, 168, 180, 0.18);
+      border-left: 4px solid rgba(95, 168, 180, 0.72);
+      background: rgba(252, 250, 246, 0.95);
+      padding: 0.72rem 0.86rem;
+      border-radius: 12px;
+      font-size: 0.94rem;
+      box-shadow: 0 8px 20px rgba(52, 43, 46, 0.05);
+    }}
+    .action-feedback.visible {{
+      display: block;
+    }}
+    .action-feedback.is-pending {{
+      border-color: rgba(61, 136, 149, 0.22);
+      border-left-color: var(--accent-deep);
+      background: rgba(244, 250, 251, 0.96);
+    }}
+    .action-feedback.is-success {{
+      border-color: rgba(60, 127, 98, 0.22);
+      border-left-color: var(--success);
+      background: rgba(244, 251, 246, 0.96);
+    }}
+    .action-feedback.is-error {{
+      border-color: rgba(177, 73, 73, 0.22);
+      border-left-color: var(--danger);
+      background: rgba(255, 245, 245, 0.96);
+    }}
     .grid {{
       display: grid;
       gap: 0.95rem;
@@ -1905,6 +1937,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         </div>
       </section>
 
+      <div id="action-feedback" class="action-feedback" aria-live="polite"></div>
+
       <div class="stats">
         <div class="stat">
           <div class="k">Posts Generated</div>
@@ -2121,6 +2155,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
       const statusLabel = () => document.getElementById("auto-status");
       const indicator = () => document.getElementById("auto-indicator");
       const checkbox = () => document.getElementById("auto-refresh");
+      const actionFeedback = () => document.getElementById("action-feedback");
+      let actionFeedbackState = null;
 
       const selectBindings = [
         ["publish-run-dir", publishRunKey],
@@ -2191,6 +2227,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }});
       }};
 
+      const showActionFeedback = (message, kind = "pending") => {{
+        actionFeedbackState = {{ message, kind }};
+        const node = actionFeedback();
+        if (!node) return;
+        node.textContent = message;
+        node.className = `action-feedback visible is-${{kind}}`;
+      }};
+
+      const restoreActionFeedback = () => {{
+        if (!actionFeedbackState) return;
+        const node = actionFeedback();
+        if (!node) return;
+        node.textContent = actionFeedbackState.message;
+        node.className = `action-feedback visible is-${{actionFeedbackState.kind}}`;
+      }};
+
       const refreshDashboard = async () => {{
         if (refreshInFlight) return;
         refreshInFlight = true;
@@ -2216,9 +2268,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
           bindForms();
           bindRefreshControls();
           restoreScrollPositions(scrollPositions);
+          restoreActionFeedback();
           apply(window.localStorage.getItem(autoRefreshKey) === "1");
         }} catch (error) {{
           console.error(error);
+          showActionFeedback(`Status refresh failed: ${{error.message}}`, "error");
         }} finally {{
           refreshInFlight = false;
         }}
@@ -2230,6 +2284,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             event.preventDefault();
             const submitter = event.submitter;
             if (submitter) submitter.disabled = true;
+            const buttonLabel = (submitter?.textContent || "Action").trim();
+            showActionFeedback(`${{buttonLabel}} requested...`, "pending");
             try {{
               const body = new URLSearchParams(new FormData(form));
               const response = await fetch(form.action, {{
@@ -2244,8 +2300,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 throw new Error(`action failed with status ${{response.status}}`);
               }}
               await refreshDashboard();
+              showActionFeedback(`${{buttonLabel}} queued successfully.`, "success");
             }} catch (error) {{
               console.error(error);
+              showActionFeedback(`${{buttonLabel}} failed: ${{error.message}}`, "error");
             }} finally {{
               if (submitter) submitter.disabled = false;
             }}
