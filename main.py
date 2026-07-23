@@ -16,7 +16,7 @@ from ascii_fallback import create_ascii_fallback_image
 from anonymize import anonymize_headline_names
 from caption import generate_caption
 from config import get_settings
-from creative import generate_collage_concept_and_prompt
+from creative import generate_collage_concept_and_prompt, generate_news_text_bundle
 from image_gen import generate_image
 from news import choose_headline, get_headlines
 from persona import get_persona_context, get_persona_state, increment_post_counter
@@ -166,19 +166,46 @@ def _generate_news_post_from_article(
     source_meta_excerpt = article_context["source_meta_excerpt"]
     logging.info("Extracted %d visual cue(s) from source context.", len(visual_cues))
 
-    logging.info("Generating short title...")
-    title = generate_title(client=client, model=settings.text_model, headline=safe_headline)
+    try:
+        logging.info("Generating title, concept, prompt, and caption in one text call...")
+        title, concept, image_prompt, caption = generate_news_text_bundle(
+            client=client,
+            model=settings.text_model,
+            headline=safe_headline,
+            persona_context=persona_context,
+            story_context=story_context,
+            visual_cues=visual_cues,
+            max_caption_chars=max_post_chars,
+        )
+    except RuntimeError as exc:
+        logging.warning(
+            "Bundled news text generation failed; falling back to separate calls: %s",
+            exc,
+        )
+        logging.info("Generating short title...")
+        title = generate_title(client=client, model=settings.text_model, headline=safe_headline)
 
-    logging.info("Generating collage concept and prompt...")
-    concept, image_prompt = generate_collage_concept_and_prompt(
-        client=client,
-        model=settings.text_model,
-        headline=safe_headline,
-        persona_context=persona_context,
-        story_context=story_context,
-        visual_cues=visual_cues,
-    )
-    logging.info("Concept: %s", concept)
+        logging.info("Generating collage concept and prompt...")
+        concept, image_prompt = generate_collage_concept_and_prompt(
+            client=client,
+            model=settings.text_model,
+            headline=safe_headline,
+            persona_context=persona_context,
+            story_context=story_context,
+            visual_cues=visual_cues,
+        )
+        logging.info("Concept: %s", concept)
+
+        logging.info("Generating caption...")
+        caption = generate_caption(
+            client=client,
+            model=settings.text_model,
+            headline=safe_headline,
+            persona_context=persona_context,
+            max_chars=max_post_chars,
+        )
+    else:
+        logging.info("Concept: %s", concept)
 
     logging.info("Generating image...")
     image_render_mode = "openai_image"
@@ -215,14 +242,6 @@ def _generate_news_post_from_article(
     except Exception as exc:
         logging.warning("Failed to build social composite image: %s", exc)
 
-    logging.info("Generating caption...")
-    caption = generate_caption(
-        client=client,
-        model=settings.text_model,
-        headline=safe_headline,
-        persona_context=persona_context,
-        max_chars=max_post_chars,
-    )
     caption_output = f"{title}\n\n{caption}"
     save_text(caption_path, caption_output)
     logging.info("Saved caption to %s", caption_path)

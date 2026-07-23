@@ -10,6 +10,31 @@ def _char_count(text: str) -> int:
     return len(text or "")
 
 
+def fit_caption_to_limit(text: str, max_chars: int | None) -> str:
+    """Trim caption locally to fit strict character limits without another API call."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if max_chars is None or max_chars <= 0 or _char_count(normalized) <= max_chars:
+        return normalized
+
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    kept: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join(kept + [sentence]).strip()
+        if candidate and _char_count(candidate) <= max_chars:
+            kept.append(sentence)
+            continue
+        break
+    if kept:
+        return " ".join(kept).strip()
+
+    clipped = normalized[:max_chars].rstrip()
+    if len(clipped) < len(normalized):
+        last_space = clipped.rfind(" ")
+        if last_space >= max(0, max_chars // 2):
+            clipped = clipped[:last_space].rstrip()
+    return clipped.strip()
+
+
 def _rewrite_caption_to_limit(
     client: OpenAI,
     model: str,
@@ -71,6 +96,10 @@ def generate_caption(
     if not caption:
         raise RuntimeError("OpenAI returned an empty caption.")
 
+    caption = fit_caption_to_limit(caption, max_chars)
+    if max_chars is not None and _char_count(caption) <= max_chars:
+        return caption
+
     if max_chars is not None and _char_count(caption) > max_chars:
         for _ in range(2):
             caption = _rewrite_caption_to_limit(
@@ -81,7 +110,7 @@ def generate_caption(
                 persona_context=persona_context,
                 headline=headline,
             )
-            caption = re.sub(r"\s+", " ", caption).strip()
+            caption = fit_caption_to_limit(caption, max_chars)
             if caption and _char_count(caption) <= max_chars:
                 break
         if _char_count(caption) > max_chars:
